@@ -1,7 +1,7 @@
 //! What a failed `corgi` call means for the history (FR-013). The patterns
 //! are best effort; this table is the one place they live, and anything it
 //! does not know shows as the first line of corgi's output.
-import { ellipsis } from "../util/text";
+import { ellipsis, spaced } from "../util/text";
 
 /** corgi's error names (after the `corgi: ` prefix) and what each means. */
 export const mapping: Record<string, "pane gone" | "unreachable"> = {
@@ -34,7 +34,7 @@ export function notFound(cmd: string): string {
   return `corgi not found: ${cmd}`;
 }
 /** The lines corgi printed, without its experimental notice and blank lines. */
-function lines(output: string): string[] {
+export function lines(output: string): string[] {
   return output
     .split("\n")
     .map(l => l.trim())
@@ -56,5 +56,5 @@ export function reasonFor(stderr: string, machine: string, code: number | null =
 export function firstLine(stderr: string, code: number | null): string {
   const said = lines(stderr);
   if (!said.length) return code === null ? "corgi exited with a signal" : `corgi exited with code ${code}`;
-  return ellipsis(said[0].replace(/^corgi:\s*/, "").replace(/[\x00-\x1f\x7f-\x9f]/g, " "), max_columns);
+  return ellipsis(spaced(said[0].replace(/^corgi:\s*/, "")), max_columns);
 }

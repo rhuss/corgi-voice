@@ -1,6 +1,6 @@
 //! The terminal under the voice window: the alternate screen with mouse
 //! reports, and redraws that write only the rows that changed, inside
-//! synchronized output. It stands in for Corgi's native frame differ.
+//! synchronized output. Rows are compared as strings: no native code (FR-026).
 //!
 //! The window draws a frame as positioned text (cursor moves, SGR colors,
 //! characters); `rows` lays such a frame onto a grid and gives back one

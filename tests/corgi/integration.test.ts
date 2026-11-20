@@ -10,7 +10,7 @@ import { Segmenter } from "../../src/voice/segmenter";
 import { Recorder } from "../../src/voice/recorder";
 import type { Tuning } from "../../src/voice/tuning";
 import { shapes } from "../fixtures/voice/make_pcm";
-import { fakeCorgi, listReply, type FakeCorgi, type Scenario } from "../fixtures/corgi";
+import { fakeCorgi, listReply, machineList, type FakeCorgi, type Scenario } from "../fixtures/corgi";
 
 const fakes: FakeCorgi[] = [],
   sessions: VoiceSession[] = [],
@@ -26,7 +26,7 @@ const one: Scenario = {
 function make(scenario: Scenario, script: string[], recorder?: Recorder) {
   const fake = fakeCorgi(scenario);
   const s = new VoiceSession({
-    link: async () => new CorgiLink({ cmd: fake.cmd, intervalMs: 100, boundMs: 4000 }),
+    link: new CorgiLink({ cmd: fake.cmd, intervalMs: 100, boundMs: 4000 }),
     transcriber: { transcribe: async () => ({ text: script.shift() ?? "" }), on: () => {} },
     segmenter: new Segmenter({ threshold: 44, timing: { silence: 0.5 }, now: () => performance.now() }),
     now: () => performance.now(),
@@ -48,7 +48,7 @@ async function until(check: () => boolean, ms = 4000) {
 
 test("speech is typed into the focused pane with pane send --stdin, joined by one space", async () => {
   const { fake, s } = make(one, ["refactor the parser module", "and add tests"]);
-  await s.connect();
+  await s.start();
   expect([s.viewer, s.focus, s.machine, s.link_state]).toEqual([true, "shell", "local", "connected"]);
   speak(s);
   speak(s);
@@ -65,7 +65,7 @@ test("with no viewer attached nothing is transcribed for dictation; a viewer att
   const whisper = (s as unknown as { deps: { transcriber: { transcribe: () => Promise<{ text: string }> } } }).deps.transcriber;
   const transcribe = whisper.transcribe;
   whisper.transcribe = () => (asked++, transcribe());
-  await s.connect();
+  await s.start();
   expect([s.viewer, s.reason]).toEqual([false, "no viewer attached"]);
   speak(s);
   await Bun.sleep(50);
@@ -84,7 +84,7 @@ test("a recording goes on while no viewer is attached: passages are written, mar
     recorder = new Recorder({ tuning, now: () => performance.now() }),
     path = join(dir, "t.txt");
   const { fake, s } = make({ machines: { local: listReply([]) } }, ["kept for the notes"], recorder);
-  await s.connect();
+  await s.start();
   recorder.start(path);
   speak(s);
   await until(() => s.history[0]?.status === "recorded");
@@ -94,9 +94,9 @@ test("a recording goes on while no viewer is attached: passages are written, mar
   recorder.finish();
 });
 
-test("Corgi not answering holds dictation off and says why; the session retries on every poll", async () => {
+test("Corgi not answering holds dictation off and says why; every poll asks again", async () => {
   const { fake, s } = make({ machines: { local: { stderr: "corgi: daemon not running\n", code: 1 } } }, ["back"]);
-  await s.connect();
+  await s.start();
   expect([s.viewer, s.link_state, s.reason]).toEqual([false, "lost", "Corgi unreachable: daemon not running"]);
   fake.set(one);
   await until(() => s.link_state === "connected" && s.viewer, 2000);
@@ -104,9 +104,68 @@ test("Corgi not answering holds dictation off and says why; the session retries 
   await until(() => s.history.at(-1)?.status === "delivered");
 });
 
+/** Whether a call's arguments are one of the commands corgi-voice may run
+ * (contracts/corgi-cli.md), with or without `--machine NAME` before them. */
+function allowed(argv: string[]): boolean {
+  const a = argv[0] === "--machine" && argv.length > 2 ? argv.slice(2) : argv,
+    shape = a.join(" ");
+  return (
+    shape === "list --json" ||
+    shape === "machine list" ||
+    shape === "list --all-machines --json" ||
+    shape === "pane send --help" ||
+    /^pane send \d+ --stdin$/.test(shape)
+  );
+}
+
+test("only text crosses to Corgi: every call is a listing or a pane send, and stdin carries the typed text alone (FR-015)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cv-int-"));
+  dirs.push(dir);
+  const tuning = { pause_break: 2, begin: () => {}, end: () => {} } as unknown as Tuning,
+    recorder = new Recorder({ tuning, now: () => performance.now() }),
+    path = join(dir, "t.txt");
+  // A remote machine is listed too, so its calls are checked as well; the viewer is local.
+  const scenario: Scenario = {
+    machineList: machineList(["local", "marovo"]),
+    machines: { ...one.machines, marovo: listReply([]) },
+  };
+  const { fake, s } = make(scenario, ["dictated words", "typed and kept", "kept only"], recorder);
+  await s.start();
+  // Dictation, then a recording: one passage typed and written, one muted and only written.
+  speak(s);
+  await until(() => s.history[0]?.status === "delivered");
+  recorder.start(path);
+  speak(s);
+  await until(() => s.history[1]?.status === "delivered");
+  s.setMuted(true);
+  speak(s);
+  await until(() => s.history[2]?.status === "recorded");
+  recorder.pause();
+  recorder.resume();
+  await recorder.stop();
+  await until(() => fake.calls().some(c => c.argv[0] === "--machine"));
+  s.close();
+  expect(readFileSync(path, "utf8")).toBe("typed and kept\nkept only\n");
+  const calls = fake.calls();
+  // Nothing but the commands of the contract, each with exactly its arguments.
+  expect(calls.filter(c => !allowed(c.argv)).map(c => c.argv)).toEqual([]);
+  expect(calls.some(c => c.argv.join(" ") === "--machine marovo list --json")).toBe(true);
+  // All that any call was given on stdin, put together, is the typed text:
+  // no audio, nothing of the recording, nothing to a call that only asks.
+  expect(calls.map(c => c.stdin).join("")).toBe("dictated words" + " typed and kept");
+  expect(calls.filter(c => c.stdin !== "").map(c => c.argv)).toEqual([
+    ["pane", "send", "5", "--stdin"],
+    ["pane", "send", "5", "--stdin"],
+  ]);
+  // Neither the transcript's path nor its text that was not typed is in any argument.
+  const said = JSON.stringify(calls.map(c => c.argv));
+  expect(said).not.toContain(path);
+  expect(said).not.toContain("kept only");
+});
+
 test("mute lives in corgi-voice: m sends nothing to Corgi and drops speech in flight", async () => {
   const { fake, s } = make(one, ["muted words", "after unmute"]);
-  await s.connect();
+  await s.start();
   // Mid-sentence, then muted: the sentence leaves no row and is never typed.
   const pcm = shapes.speech();
   for (let at = 0; at < 16000; at += 320) s.frame(pcm.subarray(at, at + 320));
@@ -137,7 +196,7 @@ test("mute lives in corgi-voice: m sends nothing to Corgi and drops speech in fl
 
 test("MUTED while the tool cannot listen, and unmuting waits for the microphone", async () => {
   const { s } = make(one, []);
-  await s.connect();
+  await s.start();
   s.setAvailable(false, "mic_missing");
   expect(s.available).toBe(false);
   s.setMuted(false);

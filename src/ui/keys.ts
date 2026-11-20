@@ -1,6 +1,5 @@
 //! Keys, clicks and wheel notches from a terminal in raw mode with SGR mouse
-//! reports, for Corgi's own full-screen frames outside the viewer: the
-//! sign-in and voice mode.
+//! reports, for the voice window.
 //! Operating system commands (`ESC ]` up to `BEL` or `ESC \`) are dropped
 //! whole for the entire session, so a terminal's late answer to the OSC 11
 //! background query is never read as keys (its `rgb:` would press `r`).

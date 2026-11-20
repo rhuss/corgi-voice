@@ -1,6 +1,17 @@
-//! Text measurement and clipping in terminal cells, on `Bun.stringWidth`
-//! instead of Corgi's native width table.
+//! Text measurement and clipping in terminal cells, on `Bun.stringWidth`,
+//! and the one definition of the control characters kept off the screen
+//! and out of what is typed.
 
+/** The control characters (C0, DEL and C1) as the inside of a character
+ * class, for a pattern that names more than these. */
+export const controls = "\\x00-\\x1f\\x7f-\\x9f";
+const control = new RegExp(`[${controls}]`, "g");
+
+/** `text` with a space for each control character, so nothing in it moves
+ * the cursor, starts an escape sequence or breaks a line. */
+export function spaced(text: string): string {
+  return text.replace(control, " ");
+}
 /** Cells the code point `cp` takes. */
 export function codepointWidth(cp: number): number {
   if (cp < 0x20 || (cp >= 0x7f && cp < 0xa0)) return 0;

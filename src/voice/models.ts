@@ -1,4 +1,4 @@
-//! The Whisper models and the speech filter voice mode can use, pinned by
+//! The Whisper models and the speech filter corgi-voice can use, pinned by
 //! size and SHA-256, and where they are cached.
 import { statSync } from "node:fs";
 import { join } from "node:path";
@@ -44,17 +44,18 @@ export function multilingual(name: ModelName): boolean {
 export function parseName(s: string): ModelName | null {
   return (names as string[]).includes(s) ? (s as ModelName) : null;
 }
-/** corgi-voice's own model cache (FR-024). */
-export function cacheDir(): string {
-  return paths.cacheDir();
+/** corgi-voice's own model cache (FR-024), as `env` places it. */
+export function cacheDir(env: NodeJS.ProcessEnv = process.env): string {
+  return paths.cacheDir(env);
 }
-export function fileOf(entry: Entry): string {
-  return join(cacheDir(), entry.file);
+export function fileOf(entry: Entry, env: NodeJS.ProcessEnv = process.env): string {
+  return join(cacheDir(env), entry.file);
 }
-/** Present with exactly the pinned size; the hash was checked on download. */
-export function installed(entry: Entry): boolean {
+/** Present with exactly the pinned size. The hash was checked when the file
+ * came in: on download, or before it was taken from the old cache. */
+export function installed(entry: Entry, env: NodeJS.ProcessEnv = process.env): boolean {
   try {
-    return statSync(fileOf(entry)).size === entry.bytes;
+    return statSync(fileOf(entry, env)).size === entry.bytes;
   } catch {
     return false;
   }

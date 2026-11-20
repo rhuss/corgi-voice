@@ -1,8 +1,9 @@
 import { test, expect, afterEach } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, chmodSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { migrate } from "../../src/util/migrate";
+import { migrate, sha256 } from "../../src/util/migrate";
 import * as models from "../../src/voice/models";
 
 const dirs: string[] = [];
@@ -36,6 +37,23 @@ function model(dir: string, entry: models.Entry): string {
   return file;
 }
 const entries = [models.catalog["tiny.en"], models.filter];
+/** Says every file has its pinned hash: the sparse stand-ins hold no real model. */
+const pinned = (file: string) => entries.find(e => file.endsWith(e.file))!.sha256;
+/** Fails the test's expectation of no notices if anything is hashed. */
+const unhashed = () => {
+  throw Error("hashed needlessly");
+};
+/** A small model of its own: `content`, pinned by its real size and hash. */
+function small(content: string | Uint8Array, file = "ggml-small-test.bin"): models.Entry {
+  const data = typeof content === "string" ? new TextEncoder().encode(content) : content;
+  return {
+    name: "tiny.en",
+    file,
+    url: "http://127.0.0.1:1/unused",
+    bytes: data.length,
+    sha256: createHash("sha256").update(data).digest("hex"),
+  };
+}
 
 test("settings are copied from the old file when the new one is missing, privately, with a notice", () => {
   const h = home();
@@ -70,14 +88,14 @@ test("without old settings nothing is created", () => {
 test("each missing model file is taken from the old cache by a hard link", () => {
   const h = home();
   const old = model(h.oldCache, models.filter);
-  const { notices } = migrate(h.env, { entries });
+  const { notices } = migrate(h.env, { entries, hash: pinned });
   const taken = join(h.newCache, models.filter.file);
   expect(statSync(taken).size).toBe(models.filter.bytes);
   // A hard link: the same file, no second copy on disk.
   expect(statSync(taken).ino).toBe(statSync(old).ino);
   expect(notices).toEqual([`Took ${models.filter.file} from ${h.oldCache}`]);
-  // Present now, it is not taken again.
-  expect(migrate(h.env, { entries }).notices).toEqual([]);
+  // Present now, it is not taken again, nor hashed again.
+  expect(migrate(h.env, { entries, hash: unhashed }).notices).toEqual([]);
 });
 
 test("a model is copied when it cannot be linked (another file system)", () => {
@@ -85,6 +103,7 @@ test("a model is copied when it cannot be linked (another file system)", () => {
   const old = model(h.oldCache, models.filter);
   migrate(h.env, {
     entries,
+    hash: pinned,
     link: () => {
       throw Object.assign(Error("cross-device link"), { code: "EXDEV" });
     },
@@ -102,8 +121,72 @@ test("partial or present models are left alone, and old files are never changed"
   const old = model(h.oldCache, models.filter);
   const before = statSync(old);
   model(h.newCache, models.filter);
-  expect(migrate(h.env, { entries }).notices).toEqual([]);
+  // Neither is hashed: a size that is off, or a file that is there, settles it.
+  expect(migrate(h.env, { entries, hash: unhashed }).notices).toEqual([]);
   expect(existsSync(join(h.newCache, models.catalog["tiny.en"].file))).toBe(false);
   const after = statSync(old);
   expect([after.size, after.mtimeMs, after.mode]).toEqual([before.size, before.mtimeMs, before.mode]);
+});
+
+test("a file is taken only when its SHA-256 is the pinned one, hashed a chunk at a time", () => {
+  const h = home(),
+    // More than the megabyte read at a time, and no multiple of it.
+    content = new Uint8Array(2_500_001).map((_, i) => (i * 31) % 251),
+    entry = small(content);
+  mkdirSync(h.oldCache, { recursive: true });
+  writeFileSync(join(h.oldCache, entry.file), content);
+  expect(sha256(join(h.oldCache, entry.file))).toBe(entry.sha256);
+  expect(migrate(h.env, { entries: [entry] }).notices).toEqual([`Took ${entry.file} from ${h.oldCache}`]);
+  expect(sha256(join(h.newCache, entry.file))).toBe(entry.sha256);
+});
+
+test("a file of the right size whose checksum does not match is not taken, and both sides stay as they are", () => {
+  const h = home(),
+    entry = small("the model that is pinned");
+  mkdirSync(h.oldCache, { recursive: true });
+  const old = join(h.oldCache, entry.file);
+  // The same length, another content: only the hash can tell.
+  writeFileSync(old, "the model that is pruned");
+  expect(statSync(old).size).toBe(entry.bytes);
+  const before = statSync(old);
+  expect(migrate(h.env, { entries: [entry] }).notices).toEqual([
+    `Did not take ${entry.file} from ${h.oldCache}: its checksum does not match`,
+  ]);
+  expect(existsSync(h.newCache)).toBe(false);
+  const after = statSync(old);
+  expect(readFileSync(old, "utf8")).toBe("the model that is pruned");
+  expect([after.size, after.mtimeMs, after.mode, after.nlink]).toEqual([before.size, before.mtimeMs, before.mode, 1]);
+  // Setup downloads it then; until it has, each start says so again.
+  expect(migrate(h.env, { entries: [entry] }).notices).toHaveLength(1);
+});
+
+test("a partial file in the new cache is left alone: nothing is taken over on top of it", () => {
+  const h = home(),
+    entry = small("a whole model");
+  mkdirSync(h.oldCache, { recursive: true });
+  mkdirSync(h.newCache, { recursive: true });
+  writeFileSync(join(h.oldCache, entry.file), "a whole model");
+  const partial = join(h.newCache, entry.file);
+  writeFileSync(partial, "a who");
+  const before = statSync(partial);
+  // The old file is whole and would match; it is not even hashed.
+  expect(migrate(h.env, { entries: [entry], hash: unhashed }).notices).toEqual([]);
+  expect(readFileSync(partial, "utf8")).toBe("a who");
+  expect([statSync(partial).ino, statSync(partial).mtimeMs]).toEqual([before.ino, before.mtimeMs]);
+  expect(statSync(join(h.oldCache, entry.file)).nlink).toBe(1);
+});
+
+test("an old file that cannot be read is reported, not taken", () => {
+  const h = home(),
+    entry = small("unreadable");
+  mkdirSync(h.oldCache, { recursive: true });
+  writeFileSync(join(h.oldCache, entry.file), "unreadable");
+  const { notices } = migrate(h.env, {
+    entries: [entry],
+    hash: () => {
+      throw Error("EACCES: permission denied");
+    },
+  });
+  expect(notices).toEqual([`Could not take ${entry.file} from ${h.oldCache}: EACCES: permission denied`]);
+  expect(existsSync(join(h.newCache, entry.file))).toBe(false);
 });

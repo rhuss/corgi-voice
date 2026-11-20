@@ -7,6 +7,7 @@ import * as paths from "../util/paths";
 import * as models from "./models";
 import * as level from "./level";
 import { default_timing } from "./segmenter";
+import { theme_settings, type ThemeSetting } from "../ui/theme";
 
 /** Speech detection while a transcript is recorded; times in seconds. */
 export type RecordingSettings = {
@@ -39,10 +40,8 @@ export type VoiceSettings = {
   /** The `corgi` command: a name looked up on PATH or a path; null is `corgi` (FR-003). */
   corgi: string | null;
   /** The color variant: from the terminal's background, or fixed (FR-027). */
-  theme: Theme;
+  theme: ThemeSetting;
 };
-export type Theme = "auto" | "light" | "dark";
-export const themes: Theme[] = ["auto", "light", "dark"];
 /** `--transcripts DIR` is kept as typed; `transcriptsFolder` resolves it. */
 export type VoiceFlags = Partial<Omit<VoiceSettings, "transcripts" | "recording" | "theme">> & {
   transcripts?: string;
@@ -120,7 +119,9 @@ export function read(file: string): { settings: VoiceSettings; notices: string[]
       settings.corgi = v as string | null;
     else notices.push(`voice.json: "corgi" must be a command name, an absolute path, a path under ~/ or null; using corgi`);
   }
-  field("theme", themes.join("|"), v => (themes as unknown[]).includes(v) ? (v as Theme) : null);
+  field("theme", theme_settings.join("|"), v =>
+    (theme_settings as readonly unknown[]).includes(v) ? (v as ThemeSetting) : null,
+  );
   if (Object.hasOwn(d, "recording")) readRecording(d.recording, settings.recording, notices);
   if (settings.recording.pause_break <= settings.recording.silence)
     notices.push(

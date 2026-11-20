@@ -8,7 +8,7 @@ import * as level from "../voice/level";
 import * as gauge from "../voice/gauge";
 import { gaugeScene, gauge_glide_ms, gauge_nose } from "./gauge_scene";
 import { keys, KeyFeed, type Key } from "./keys";
-import { displayWidth, ellipsis } from "../util/text";
+import { displayWidth, ellipsis, spaced } from "../util/text";
 import { thumb } from "./scroll_thumb";
 import { Screen, rows as frameRows } from "./screen";
 import { FilePrompt } from "./prompt";
@@ -188,9 +188,9 @@ export type Options = {
   setThreshold: (pct: number) => void;
   listDevices: () => Promise<{ devices: Device[]; notice?: string }>;
   switchDevice: (device: Device) => void;
-  /** Ends voice mode; with a recording, the first call waits for its transcript. */
+  /** Ends corgi-voice; with a recording, the first call waits for its transcript. */
   quit: () => void;
-  /** Transcript recording, when voice mode offers it. */
+  /** Transcript recording, when it is offered. */
   recorder?: Recorder;
   /** The values in effect, read for drawing instead of `threshold` and `timing`. */
   tuning?: Tuning;
@@ -235,6 +235,7 @@ function linkStatus(session: VoiceSession): string | null {
     case "connecting":
       return "Asking Corgi for its viewers…";
     case "lost":
+      // The poller asks again every second by itself.
       return `${session.reason ?? "Corgi unreachable"}; retrying every second`;
     default:
       return null;
@@ -353,7 +354,7 @@ function describe(u: Utterance): { glyph: string; style: string; label: string }
         glyph: "●",
         style: muted,
         label:
-          !u.maybe_typed && u.reason === "muted"
+          !u.maybe_typed && u.untyped === "muted"
             ? said
             : `${said} · ${u.maybe_typed ? "recorded" : "recorded, not typed"} (${u.reason})`,
       };
@@ -471,7 +472,7 @@ export class VoiceUi {
     for (let y = 0; y < rows; y++) frame += at(y, 0) + plain + " ".repeat(cols);
     const put = (y: number, x: number, style: string, value: string, room = cols - x) => {
       if (y < 0 || y >= rows || room <= 0) return 0;
-      const shown = ellipsis(value.replace(/[\x00-\x1f\x7f-\x9f]/g, " "), room);
+      const shown = ellipsis(spaced(value), room);
       frame += at(y, x) + style + shown + reset;
       return displayWidth(shown);
     };
@@ -479,7 +480,7 @@ export class VoiceUi {
       put(0, 0, text, "Make this window bigger for voice mode.");
       return frame;
     }
-    // Title: a note for the mode that a click mutes or unmutes, then voice mode.
+    // Title: a note for the mode that a click mutes or unmutes, then the name.
     const state = mode(s),
       mute = () => this.session.setMuted(!this.session.muted);
     this.hits = [{ y: 0, x: 0, width: 3, act: mute, mute: true }];
@@ -655,7 +656,7 @@ export class VoiceUi {
     if (blocked) return [s.available && s.link_state !== "lost" ? muted : warm, blocked];
     if (error) return [warm, `Cannot write the transcript: ${error}`];
     if (!s.viewer)
-      return s.reason && s.reason !== "no viewer attached"
+      return s.reason && s.why !== null && s.why !== "no_viewer"
         ? [warm, `${s.reason}; nothing is typed until Corgi answers`]
         : [muted, "No Corgi window is attached; nothing is typed until one is"];
     return null;
@@ -803,7 +804,7 @@ export class VoiceUi {
         ? ["Listing microphones…"]
         : p.devices.map(
             (d, i) =>
-              `${i === p.choice ? "❯" : " "} ${d.label.replace(/[\x00-\x1f\x7f-\x9f]/g, " ")}${d.default ? "  (default)" : ""}`,
+              `${i === p.choice ? "❯" : " "} ${spaced(d.label)}${d.default ? "  (default)" : ""}`,
           ),
       width = Math.min(cols - 4, Math.max(36, ...lines.map(l => displayWidth(l) + 4))),
       height = Math.min(rows - 4, lines.length + (p.notice ? 5 : 4)),
@@ -1049,10 +1050,11 @@ export class VoiceUi {
 }
 
 /** Runs `ui` in this process's terminal until `stop` resolves, then restores
- * the terminal. A signal restores it and runs `cleanup`; Ctrl+C itself is a
- * key in raw mode, so SIGINT only comes from elsewhere. An uncaught error or
- * an exit restores it too. */
-export async function run(ui: VoiceUi, stop: Promise<void>, cleanup: () => Promise<void>): Promise<void> {
+ * the terminal. Before it takes the terminal, `taken` is handed the way to
+ * give it back, for an end that does not come through here: a signal, an
+ * uncaught error or an exit, which the caller's cleanup handles. Ctrl+C
+ * itself is a key in raw mode, so SIGINT only comes from elsewhere. */
+export async function run(ui: VoiceUi, stop: Promise<void>, taken: (restore: () => void) => void): Promise<void> {
   const size = () => ({ cols: process.stdout.columns || 80, rows: process.stdout.rows || 24 }),
     screen = new Screen(process.stdout);
   let { cols, rows } = size();
@@ -1082,7 +1084,7 @@ export async function run(ui: VoiceUi, stop: Promise<void>, cleanup: () => Promi
     screen.resize();
     paint();
   };
-  // A signal tears down at once, and the stop it settles must not do it again.
+  // Whatever restores first, the others must not do it again.
   let restored = false,
     timer: ReturnType<typeof setInterval> | undefined;
   const restore = () => {
@@ -1098,23 +1100,10 @@ export async function run(ui: VoiceUi, stop: Promise<void>, cleanup: () => Promi
     } catch {}
     process.stdin.pause();
   };
-  const signals = ["SIGINT", "SIGHUP", "SIGTERM"] as const,
-    onSignal = () => {
-      restore();
-      void cleanup().finally(() => process.exit(1));
-    },
-    onCrash = (error: unknown) => {
-      restore();
-      process.stderr.write(`corgi-voice: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`);
-      void cleanup().finally(() => process.exit(1));
-    };
-  for (const signal of signals) process.on(signal, onSignal);
-  process.on("uncaughtException", onCrash);
-  process.on("unhandledRejection", onCrash);
-  process.on("exit", restore);
+  taken(restore);
   try {
-    // Inside the cleanup: a failure while taking the terminal or in the
-    // first frame gives it back as it was.
+    // Inside the try: a failure while taking the terminal or in the first
+    // frame gives it back as it was.
     process.stdin.setRawMode(true);
     process.stdin.resume();
     process.stdin.on("data", onData);
@@ -1125,10 +1114,6 @@ export async function run(ui: VoiceUi, stop: Promise<void>, cleanup: () => Promi
     paint();
     await stop;
   } finally {
-    for (const signal of signals) process.off(signal, onSignal);
-    process.off("uncaughtException", onCrash);
-    process.off("unhandledRejection", onCrash);
-    process.off("exit", restore);
     restore();
   }
 }

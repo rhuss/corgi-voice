@@ -42,6 +42,7 @@ It exits with status 1 while something required is missing.
 
 If you used `corgi voice` before, setup (and the first start) takes over its settings and models:
 the settings file is copied, and each model is hard linked (or copied) from the old cache instead of downloaded.
+A model is taken only when its SHA-256 checksum is the pinned one; a file that does not match is left where it is, named in a notice, and downloaded by setup instead.
 The old files are never changed or removed.
 
 Models: `tiny.en`, `base.en` (default), `small.en`, `medium`, `large-v3-turbo`.
@@ -131,6 +132,7 @@ Editing keys: Backspace, Left and Right, Home and End, Ctrl+A, Ctrl+E, Ctrl+U, C
 The transcript has one line per passage and a blank line before each new contribution (a pause longer than `pause_break`).
 Each passage is synced to disk as it is written.
 Starting a recording mutes dictation; stopping it puts the mute back as it was.
+When corgi-voice ends while passages are still being transcribed, by a second quit press or by a signal, the transcript is closed without them and the terminal says how many were left out.
 
 ## Settings
 
@@ -174,6 +176,10 @@ With `--verbose`, each utterance's line in `voice.log` also shows its cut: `post
 That end includes the filter's padding, so compare it with `kept=` and `pad=` rather than reading it as your last word.
 To report it, `--verbose` asks Whisper for subtitles instead of plain text, as their cues carry the segment times.
 If sentence endings are lost with music or a raised threshold, lengthen post-roll or pick "whole pause", and compare these values with the utterance's duration.
+
+The log also has one `delivery:` line per `corgi pane send`: whether it was delivered, failed or abandoned at the 2 second bound, the machine and pane, the time it took, the exit code, and the first line of what `corgi` said when it failed.
+The dictated text itself is never logged.
+A machine, or `corgi machine list`, that stops answering is logged once per distinct failure, and once when it answers again.
 
 Read only, for taking over from `corgi voice`: `$XDG_STATE_HOME/corgi/voice.json` and `$XDG_CACHE_HOME/corgi/voice/` (or their `~/.local/state` and `~/.cache` forms).
 

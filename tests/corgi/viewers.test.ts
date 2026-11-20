@@ -112,21 +112,39 @@ test("the target carries the pane's label, else its id", () => {
   expect(resolve([m], null, now).target?.label).toBe("claude · api");
 });
 
-test("step 2: no candidate says why", () => {
+test("the target says when its pane has exited or is hibernated, and takes no text", () => {
+  const m = machine("local", [v(1, 10, 1)]);
+  // A pane the listing does not know is not known to be gone.
+  expect(resolve([m], null, now).target?.gone).toBe(false);
+  m.panes.set(10, { id: 10, label: "shell", exited: false, dormant: false });
+  expect(resolve([m], null, now).target?.gone).toBe(false);
+  m.panes.set(10, { id: 10, label: "shell", exited: true, dormant: false });
+  expect(resolve([m], null, now).target?.gone).toBe(true);
+  m.panes.set(10, { id: 10, label: "shell", exited: false, dormant: true });
+  expect(resolve([m], null, now).target?.gone).toBe(true);
+});
+
+test("step 2: no candidate says why, in words and as a cause", () => {
   expect(resolve([machine("local", [v(1, null, 5)])], null, now)).toEqual({
     target: null,
     reason: "no viewer attached",
+    why: "no_viewer",
   });
   expect(resolve([machine("local", [])], null, now).reason).toBe("no viewer attached");
   expect(
-    resolve([machine("local", [], { state: "unreachable", error: "daemon not running", fetchedAt: 0 })], null, now)
-      .reason,
-  ).toBe("Corgi unreachable: daemon not running");
+    resolve([machine("local", [], { state: "unreachable", error: "daemon not running", fetchedAt: 0 })], null, now),
+  ).toEqual({ target: null, reason: "Corgi unreachable: daemon not running", why: "unreachable" });
   expect(
-    resolve([machine("local", [], { state: "not-understood", error: "Corgi output not understood" })], null, now)
-      .reason,
-  ).toBe("Corgi output not understood");
+    resolve([machine("local", [], { state: "not-understood", error: "Corgi output not understood" })], null, now),
+  ).toEqual({ target: null, reason: "Corgi output not understood", why: "not_understood" });
+  // A remote machine alone that is not understood, with no local answer.
+  expect(
+    resolve([machine("marovo", [], { state: "not-understood", error: "Corgi output not understood" })], null, now).why,
+  ).toBe("not_understood");
   expect(resolve([], null, now).reason).toStartWith("Corgi unreachable");
+  expect(resolve([], null, now).why).toBe("unreachable");
+  // With a target there is neither.
+  expect(resolve([machine("local", [v(1, 10, 5)])], null, now)).toMatchObject({ reason: null, why: null });
 });
 
 test("step 3 and 4: one candidate, else the only watched one", () => {
@@ -187,9 +205,13 @@ test("a viewer showing a machine that stopped answering names that machine", () 
   expect(resolve([local, marovo], null, now)).toEqual({
     target: null,
     reason: "marovo unreachable: RequestTimedOut",
+    why: "unreachable",
   });
   // With no viewer at all, nobody is looking at marovo.
-  expect(resolve([machine("local", []), marovo], null, now).reason).toBe("no viewer attached");
+  expect(resolve([machine("local", []), marovo], null, now)).toMatchObject({
+    reason: "no viewer attached",
+    why: "no_viewer",
+  });
   // With every machine answering, a viewer without a pane is just not attached to any.
   expect(resolve([local, machine("marovo", [v(4, null, 2)])], null, now).reason).toBe("no viewer attached");
 });

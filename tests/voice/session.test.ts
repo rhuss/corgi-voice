@@ -2,21 +2,24 @@ import { test, expect, afterEach } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { VoiceSession, max_queued } from "../../src/voice/session";
+import { VoiceSession, max_queued, safety_ms } from "../../src/voice/session";
 import { Segmenter } from "../../src/voice/segmenter";
 import { Recorder } from "../../src/voice/recorder";
-import { Events, type Seen, type VoiceLink } from "../../src/voice/link";
+import { Events, deadline_ms, type Seen, type VoiceLink } from "../../src/voice/link";
 import type { Tuning } from "../../src/voice/tuning";
 import { shapes, concat, music, silence, tone } from "../fixtures/voice/make_pcm";
 import * as level from "../../src/voice/level";
 
-/** What the link reports: a viewer on `focus`, or none. */
-const seen = (viewer: boolean, focus: string | null, reason: string | null = null): Seen => ({
+/** What the link reports: a viewer on `focus`, or none attached. */
+const seen = (viewer: boolean, focus: string | null): Seen => ({
   viewer,
   focus,
   machine: viewer ? "local" : null,
-  reason: viewer ? null : (reason ?? "no viewer attached"),
+  reason: viewer ? null : "no viewer attached",
+  why: viewer ? null : "no_viewer",
 });
+/** No target, because Corgi or the machine a viewer shows does not answer. */
+const unreachable = (reason: string): Seen => ({ viewer: false, focus: null, machine: null, reason, why: "unreachable" });
 /** A link whose replies the test hands out. */
 class FakeLink implements VoiceLink {
   events = new Events();
@@ -25,17 +28,26 @@ class FakeLink implements VoiceLink {
   closed = false;
   /** Whether a viewer would take text, as the watch reply says. */
   viewer = true;
+  /** What the first view waits for, or fails with. */
+  watching: () => Promise<void> = async () => {};
   reply: (op: string, value?: unknown) => Promise<any> = async () => ({ machine: "local", pane: 1, viewer: 1 });
   async watch(): Promise<Seen> {
     this.watches++;
-    return { viewer: this.viewer, focus: "dictation", machine: "local", reason: this.viewer ? null : "no viewer attached" };
+    await this.watching();
+    return {
+      viewer: this.viewer,
+      focus: "dictation",
+      machine: "local",
+      reason: this.viewer ? null : "no viewer attached",
+      why: this.viewer ? null : "no_viewer",
+    };
   }
   type(text: string) {
     this.calls.push({ op: "type", value: text, at: performance.now() });
     return this.reply("type", text);
   }
-  on(event: "viewer" | "closed", fn: (value: any) => void) {
-    this.events.on(event, fn);
+  on(_event: "viewer", fn: (seen: Seen) => void) {
+    this.events.on("viewer", fn);
   }
   close() {
     this.closed = true;
@@ -65,7 +77,6 @@ function session(
   script: string[],
   opts: {
     link?: FakeLink;
-    links?: () => Promise<VoiceLink>;
     timeout?: number;
     recorder?: Recorder;
     log?: (line: string) => void;
@@ -78,12 +89,11 @@ function session(
     // The recorder's clock: a resume breaks by when speech began.
     segmenter = new Segmenter({ threshold: 44, timing: { silence: 0.5 }, now }),
     s = new VoiceSession({
-      link: opts.links ?? (async () => link),
+      link,
       transcriber: whisper,
       segmenter,
       now,
       deliverTimeoutMs: opts.timeout ?? 2000,
-      retryMs: 20,
       recorder: opts.recorder,
       log: opts.log,
     });
@@ -124,7 +134,7 @@ test("utterances are typed one delivery at a time", async () => {
     return { machine: "local", pane: 1, viewer: 1 };
   };
   const { s } = session(["refactor the parser", "um, add tests"], { link });
-  await s.connect();
+  await s.start();
   speak(s);
   speak(s);
   await until(() => s.history.filter(u => u.status === "delivered").length === 2);
@@ -145,7 +155,7 @@ test("a delivery that never returns fails at the bound without holding up the ne
     return Promise.resolve({ machine: "local", pane: 1, viewer: 1 });
   };
   const { s, whisper } = session(["stuck", "next one please"], { link, timeout: 300 });
-  await s.connect();
+  await s.start();
   speak(s);
   await until(() => s.history[0]?.status === "delivering");
   const hung = performance.now();
@@ -160,27 +170,54 @@ test("a delivery that never returns fails at the bound without holding up the ne
   expect(performance.now() - hung).toBeLessThan(300 + 150);
 });
 
-test("what is said while disconnected fails and is never sent later", async () => {
+test("what Corgi cannot take while it is unreachable is dropped with the reason, and never sent later", async () => {
   const link = new FakeLink(),
-    links = [link, new FakeLink()];
-  let connects = 0;
-  const { s } = session(["lost words", "after"], { links: async () => links[Math.min(connects++, 1)] });
-  await s.connect();
-  link.events.emitClosed("runtime_gone");
-  expect(s.link_state).toBe("lost");
+    why = "Corgi unreachable: daemon not running";
+  let release!: () => void,
+    first = true;
+  link.reply = () => {
+    if (!first) return Promise.resolve({ machine: "local", pane: 1, viewer: 1 });
+    first = false;
+    return new Promise(resolve => (release = () => resolve({ machine: "local", pane: 1, viewer: 1 })));
+  };
+  const { s, whisper } = session(["on its way", "transcribed already", "after"], { link });
+  await s.start();
   speak(s);
-  await until(() => s.history[0]?.status === "failed");
-  expect(s.history[0].reason).toBe("not connected");
-  await until(() => s.link_state === "connected");
+  await until(() => s.history[0]?.status === "delivering");
+  // Transcribed, and waiting behind the delivery in flight.
   speak(s);
-  await until(() => s.history[1]?.status === "delivered");
-  expect(links[1].calls.map(c => c.value)).toEqual(["after"]);
-  expect(link.calls).toEqual([]);
+  await until(() => s.history[1]?.text === "transcribed already");
+  // And a sentence still being spoken.
+  const pcm = shapes.speech();
+  for (let at = 0; at < 16000; at += 320) s.frame(pcm.subarray(at, at + 320));
+  expect(s.history[2].status).toBe("recording");
+  link.events.emitViewer(unreachable(why));
+  expect([s.link_state, s.viewer, s.reason]).toEqual(["lost", false, why]);
+  // Both are dropped at once, naming Corgi; neither waits for it to come back.
+  expect(statuses(s).slice(1)).toEqual([
+    ["discarded", why],
+    ["discarded", why],
+  ]);
+  // What is said meanwhile is not even transcribed.
+  speak(s);
+  await Bun.sleep(30);
+  expect([s.history.length, whisper.requests]).toEqual([3, 2]);
+  // The delivery in flight ends as Corgi answers it.
+  release();
+  await until(() => s.history[0].status === "delivered");
+  // Corgi is back: nothing was kept to send now.
+  link.events.emitViewer(seen(true, "dictation"));
+  expect(s.link_state).toBe("connected");
+  await Bun.sleep(50);
+  expect(link.calls.map(c => c.value)).toEqual(["on its way"]);
+  speak(s);
+  await until(() => s.history.at(-1)?.status === "delivered");
+  expect(link.calls.map(c => c.value)).toEqual(["on its way", "after"]);
 });
 
 test("muting discards what is being said or transcribed", async () => {
   const { s, link, whisper } = session(["first", "second"]);
-  await s.connect();
+  await s.start();
   const pcm = shapes.speech();
   for (let at = 0; at < 16000; at += 320) s.frame(pcm.subarray(at, at + 320));
   expect(s.history[0].status).toBe("recording");
@@ -207,7 +244,7 @@ test("a Whisper that falls behind is not handed more than four recordings", asyn
   const { s, whisper, link } = session(["one", "two", "three", "four"]);
   let open!: () => void;
   whisper.gate = new Promise(resolve => (open = resolve));
-  await s.connect();
+  await s.start();
   for (let i = 0; i < 6; i++) speak(s);
   expect(statuses(s).map(([status]) => status)).toEqual([...Array(4).fill("transcribing"), "failed", "failed"]);
   expect(s.history[5].reason).toBe("backlog");
@@ -220,11 +257,11 @@ test("a Whisper that falls behind is not handed more than four recordings", asyn
   expect(s.history.at(-1)?.reason).not.toBe("backlog");
 });
 
-test("a runtime that is slow to take text is not handed more than four utterances", async () => {
+test("a Corgi that is slow to take text is not handed more than four utterances", async () => {
   const link = new FakeLink();
   link.reply = () => new Promise(() => {});
   const { s } = session(["a", "b", "c", "d", "e", "f"], { link, timeout: 200 });
-  await s.connect();
+  await s.start();
   for (let i = 0; i < 6; i++) speak(s);
   await until(() => s.history[0]?.status === "delivering");
   expect(statuses(s).map(([status]) => status)).toEqual([
@@ -242,7 +279,7 @@ test("a runtime that is slow to take text is not handed more than four utterance
 
 test("words that sound like commands are typed as text", async () => {
   const { s, link } = session(["Send.", "next"]);
-  await s.connect();
+  await s.start();
   speak(s);
   speak(s);
   await until(() => s.history.filter(u => u.status === "delivered").length === 2);
@@ -254,7 +291,7 @@ test("words that sound like commands are typed as text", async () => {
 
 test("non-speech and phantom text are dropped, not typed", async () => {
   const { s, link } = session(["[BLANK_AUDIO]", "Thank you.", "um"]);
-  await s.connect();
+  await s.start();
   speak(s);
   speak(s);
   speak(s);
@@ -272,7 +309,7 @@ test("a crash spares text Whisper already gave back", async () => {
     return new Promise(resolve => (release = () => resolve({ machine: "local", pane: 1, viewer: 1 })));
   };
   const { s, whisper } = session(["held", "waiting"], { link });
-  await s.connect();
+  await s.start();
   speak(s);
   await until(() => s.history[0]?.status === "delivering");
   // Transcribed, and queued behind the delivery that hangs.
@@ -287,7 +324,7 @@ test("a crash spares text Whisper already gave back", async () => {
 
 test("speech during a filter switch fails as such, not as a crash", async () => {
   const { s, whisper } = session([]);
-  await s.connect();
+  await s.start();
   whisper.transcribe = () => Promise.reject(Error("ServerRestarting"));
   speak(s);
   await until(() => s.history[0]?.status === "failed");
@@ -297,7 +334,7 @@ test("speech during a filter switch fails as such, not as a crash", async () => 
 
 test("a fresh server after a crash makes voice listen again", async () => {
   const { s, link, whisper } = session(["back again"]);
-  await s.connect();
+  await s.start();
   whisper.crash(3);
   expect(s.available).toBe(false);
   s.serverReady();
@@ -311,7 +348,7 @@ test("a fresh server after a crash makes voice listen again", async () => {
 
 test("a server crash fails the utterance and stops listening", async () => {
   const { s, link, whisper } = session([]);
-  await s.connect();
+  await s.start();
   whisper.transcribe = () => new Promise(() => {});
   speak(s);
   await until(() => s.history[0]?.status === "transcribing");
@@ -327,7 +364,7 @@ test("a server crash fails the utterance and stops listening", async () => {
 
 test("a microphone that comes back does not revive a crashed server", async () => {
   const { s, link, whisper } = session([]);
-  await s.connect();
+  await s.start();
   whisper.crash(3);
   s.setAvailable(false, "mic_missing");
   s.frame(new Int16Array(320));
@@ -339,7 +376,7 @@ test("a microphone that comes back does not revive a crashed server", async () =
 
 test("a microphone that comes back makes voice available again", async () => {
   const { s, link } = session([]);
-  await s.connect();
+  await s.start();
   s.setAvailable(false, "mic_denied");
   expect(s.unavailable).toBe("mic_denied");
   s.frame(new Int16Array(320));
@@ -347,39 +384,39 @@ test("a microphone that comes back makes voice available again", async () => {
   expect(link.calls).toEqual([]);
 });
 
-test("a first connection that fails and is given up on never retries", async () => {
-  let attempts = 0;
-  const { s } = session([], {
-    links: async () => {
-      attempts++;
-      throw Error("NoRuntime");
-    },
-  });
-  await expect(s.connect()).rejects.toThrow("NoRuntime");
-  s.close();
+test("a link that cannot start makes start() reject, and nothing retries behind the caller's back", async () => {
+  const link = new FakeLink();
+  link.watching = async () => {
+    throw Error("FileNotFound");
+  };
+  const { s } = session([], { link });
+  await expect(s.start()).rejects.toThrow("FileNotFound");
   await Bun.sleep(60);
-  expect(attempts).toBe(1);
+  expect(link.watches).toBe(1);
+  expect(s.link_state).toBe("connecting");
 });
 
-test("quitting while a connection is on its way attaches nothing", async () => {
+test("quitting before the link's first view takes nothing from it, then or later", async () => {
   const link = new FakeLink();
   let release!: () => void;
-  const { s } = session([], {
-    links: () => new Promise(resolve => (release = () => resolve(link))),
-  });
-  const connecting = s.connect();
+  link.watching = () => new Promise(resolve => (release = resolve));
+  const { s } = session([], { link });
+  const starting = s.start();
+  expect(s.link_state).toBe("connecting");
   s.close();
   release();
-  await connecting;
+  await starting;
   expect(link.closed).toBe(true);
-  expect(link.watches).toBe(0);
+  expect([s.link_state, s.focus]).toEqual(["closed", null]);
+  link.events.emitViewer(seen(true, "build"));
+  expect([s.link_state, s.focus]).toEqual(["closed", null]);
 });
 
 test("without a viewer, voice holds off and drops what is in progress", async () => {
   const link = new FakeLink();
   link.viewer = false;
   const { s, whisper } = session(["lost"], { link });
-  await s.connect();
+  await s.start();
   expect([s.viewer, s.focus]).toEqual([false, "dictation"]);
   speak(s);
   await Bun.sleep(30);
@@ -397,36 +434,9 @@ test("without a viewer, voice holds off and drops what is in progress", async ()
   expect(link.calls).toEqual([]);
 });
 
-test("a link that keeps failing is logged once per distinct failure", async () => {
-  const lines: string[] = [];
-  let attempts = 0,
-    failure = "NoRuntime";
-  const link = new FakeLink(),
-    s = new VoiceSession({
-      link: async () => {
-        attempts++;
-        if (failure) throw Error(failure);
-        return link;
-      },
-      transcriber: new FakeWhisper([]),
-      segmenter: new Segmenter({ threshold: 44, now: () => 0 }),
-      now: () => performance.now(),
-      retryMs: 5,
-      log: line => lines.push(line),
-    });
-  await s.connect().catch(() => {});
-  await until(() => attempts >= 5);
-  failure = "SshFailed";
-  await until(() => attempts >= 10);
-  failure = "";
-  await until(() => s.link_state === "connected");
-  s.close();
-  expect(lines).toEqual(["link: NoRuntime", "link: SshFailed", "link: connected"]);
-});
-
 test("a transcription that times out says so, not that it may have been typed", async () => {
   const { s, whisper, link } = session([]);
-  await s.connect();
+  await s.start();
   whisper.transcribe = () => Promise.reject(Error("Timeout"));
   speak(s);
   await until(() => s.history[0]?.status === "failed");
@@ -437,7 +447,7 @@ test("a transcription that times out says so, not that it may have been typed", 
 test("a recording while unmuted writes each passage and types it too", async () => {
   const { recorder: r, path } = recorder(),
     { s, link } = session(["refactor the parser", "um, add tests"], { recorder: r });
-  await s.connect();
+  await s.start();
   r.start(path);
   speak(s);
   speak(s);
@@ -450,7 +460,7 @@ test("a recording while unmuted writes each passage and types it too", async () 
 test("a passage that began before the recording and ended after it is written", async () => {
   const { recorder: r, path } = recorder(),
     { s } = session(["straddles the start"], { recorder: r });
-  await s.connect();
+  await s.start();
   const pcm = shapes.speech();
   let at = 0;
   for (; at < 16000; at += 320) s.frame(pcm.subarray(at, at + 320));
@@ -465,7 +475,7 @@ test("a passage that ends before the recording starts is not written", async () 
     { s, whisper } = session(["before"], { recorder: r });
   let open!: () => void;
   whisper.gate = new Promise(resolve => (open = resolve));
-  await s.connect();
+  await s.start();
   speak(s);
   r.start(path);
   open();
@@ -477,7 +487,7 @@ test("a passage that ends before the recording starts is not written", async () 
 test("a claimed passage that comes to nothing does not hold up a stop", async () => {
   const { recorder: r, path } = recorder(),
     { s, whisper } = session(["um", ""], { recorder: r });
-  await s.connect();
+  await s.start();
   r.start(path);
   speak(s);
   await until(() => s.history[0]?.status === "dropped");
@@ -505,7 +515,7 @@ function end(s: VoiceSession, pcm: Int16Array) {
 test("muted while recording, speech is written but never typed", async () => {
   const { recorder: r, path } = recorder(),
     { s, link } = session(["a call", "goes on"], { recorder: r });
-  await s.connect();
+  await s.start();
   s.setMuted(true);
   r.start(path);
   speak(s);
@@ -522,7 +532,7 @@ test("muted while recording, speech is written but never typed", async () => {
 test("muted with the recording paused, audio is dropped as before", async () => {
   const { recorder: r, path } = recorder(),
     { s, whisper, link } = session(["private"], { recorder: r });
-  await s.connect();
+  await s.start();
   r.start(path);
   r.pause();
   s.setMuted(true);
@@ -537,7 +547,7 @@ test("muted with the recording paused, audio is dropped as before", async () => 
 test("a mute in the middle of a passage still writes it, untyped", async () => {
   const { recorder: r, path } = recorder(),
     { s, link } = session(["half muted"], { recorder: r });
-  await s.connect();
+  await s.start();
   r.start(path);
   const pcm = shapes.speech();
   begin(s, pcm);
@@ -553,7 +563,7 @@ test("a mute in the middle of a passage still writes it, untyped", async () => {
 test("speech that began muted stays untyped after an unmute", async () => {
   const { recorder: r, path } = recorder(),
     { s, link } = session(["private aside"], { recorder: r });
-  await s.connect();
+  await s.start();
   r.start(path);
   s.setMuted(true);
   const pcm = shapes.speech();
@@ -570,7 +580,7 @@ test("speech that began without a viewer stays untyped when one attaches", async
   const { recorder: r, path } = recorder(),
     link = new FakeLink(),
     { s } = session(["before the window"], { link, recorder: r });
-  await s.connect();
+  await s.start();
   r.start(path);
   link.events.emitViewer(seen(false, null));
   const pcm = shapes.speech();
@@ -587,9 +597,9 @@ test("a passage recorded while a machine is unreachable says so, not 'no viewer'
   const { recorder: r, path } = recorder(),
     link = new FakeLink(),
     { s } = session(["while marovo is away"], { link, recorder: r });
-  await s.connect();
+  await s.start();
   r.start(path);
-  link.events.emitViewer(seen(false, null, "marovo unreachable: no answer in time"));
+  link.events.emitViewer(unreachable("marovo unreachable: no answer in time"));
   const pcm = shapes.speech();
   begin(s, pcm);
   end(s, pcm);
@@ -602,39 +612,21 @@ test("a passage recorded while a machine is unreachable says so, not 'no viewer'
 test("speech dropped when its machine stops answering names the machine", async () => {
   const link = new FakeLink(),
     { s } = session(["never typed"], { link });
-  await s.connect();
+  await s.start();
   const pcm = shapes.speech();
   for (let at = 0; at < 16000; at += 320) s.frame(pcm.subarray(at, at + 320));
   expect(s.recording).toBe(true);
-  link.events.emitViewer(seen(false, null, "marovo unreachable: no answer in time"));
+  link.events.emitViewer(unreachable("marovo unreachable: no answer in time"));
   expect(statuses(s)).toEqual([["discarded", "marovo unreachable: no answer in time"]]);
   expect(link.calls).toEqual([]);
-});
-
-test("a recorded passage that ends while the link is down is typed once it is back", async () => {
-  const { recorder: r, path } = recorder();
-  // Each connection gets a fresh link; `current` is the one in use.
-  let current = new FakeLink();
-  const { s, whisper } = session(["back again"], { links: async () => (current = new FakeLink()), recorder: r });
-  let open!: () => void;
-  whisper.gate = new Promise(resolve => (open = resolve));
-  await s.connect();
-  current.events.emitClosed("runtime_gone");
-  r.start(path);
-  speak(s);
-  await until(() => s.link_state === "connected");
-  open();
-  await until(() => s.history[0]?.status === "delivered");
-  expect(current.calls.map(c => c.value)).toEqual(["back again"]);
-  expect(transcript(path)).toBe("back again\n");
 });
 
 test("a recorded passage whose typing gets no answer may have been typed", async () => {
   const { recorder: r, path } = recorder(),
     link = new FakeLink(),
-    { s } = session(["slow runtime"], { link, recorder: r, timeout: 30 });
+    { s } = session(["slow to answer"], { link, recorder: r, timeout: 30 });
   link.reply = () => new Promise(() => {});
-  await s.connect();
+  await s.start();
   r.start(path);
   speak(s);
   await until(() => s.history[0]?.status === "recorded");
@@ -643,15 +635,15 @@ test("a recorded passage whose typing gets no answer may have been typed", async
     reason: "no answer in time; may have been typed",
     maybe_typed: true,
   });
-  expect(link.calls.map(c => c.value)).toEqual(["slow runtime"]);
-  expect(transcript(path)).toBe("slow runtime\n");
+  expect(link.calls.map(c => c.value)).toEqual(["slow to answer"]);
+  expect(transcript(path)).toBe("slow to answer\n");
 });
 
 test("muted, a passage cut off by a pause or a stop is dropped, unheard and unwritten", async () => {
   for (const end_recording of ["pause", "stop"] as const) {
     const { recorder: r, path } = recorder(),
       { s, whisper, link } = session(["private"], { recorder: r });
-    await s.connect();
+    await s.start();
     r.start(path);
     s.setMuted(true);
     const pcm = shapes.speech();
@@ -669,11 +661,11 @@ test("muted, a passage cut off by a pause or a stop is dropped, unheard and unwr
   }
 });
 
-test("nothing about a recording goes to the runtime, only the typed text", async () => {
+test("a recording asks nothing more of the link: only the passage that is typed reaches it", async () => {
   const { recorder: r, path } = recorder(),
     link = new FakeLink(),
     { s } = session(["typed and kept", "kept only"], { link, recorder: r });
-  await s.connect();
+  await s.start();
   r.start(path);
   speak(s);
   await until(() => s.history[0]?.status === "delivered");
@@ -683,9 +675,9 @@ test("nothing about a recording goes to the runtime, only the typed text", async
   r.pause();
   r.resume();
   await r.stop();
+  // The mute, the pause and the stop are no calls; what the corgi command
+  // itself is given is checked in corgi/integration.test.ts (FR-015).
   expect(link.calls.map(c => [c.op, c.value])).toEqual([["type", "typed and kept"]]);
-  // Neither the mute, the path nor the recording state goes to Corgi.
-  expect(JSON.stringify(link.calls)).not.toContain(path);
   expect(transcript(path)).toBe("typed and kept\nkept only\n");
 });
 
@@ -693,7 +685,7 @@ test("a viewer that leaves mid-passage leaves it written and untyped", async () 
   const { recorder: r, path } = recorder(),
     link = new FakeLink(),
     { s } = session(["nobody watching", "still nobody"], { link, recorder: r });
-  await s.connect();
+  await s.start();
   r.start(path);
   const pcm = shapes.speech();
   begin(s, pcm);
@@ -710,16 +702,18 @@ test("a viewer that leaves mid-passage leaves it written and untyped", async () 
   expect(transcript(path)).toBe("nobody watching\nstill nobody\n");
 });
 
-test("with the link down, a recorded passage is written and says why it was not typed", async () => {
+test("while Corgi is unreachable, a recorded passage is written and says why it was not typed", async () => {
   const { recorder: r, path } = recorder(),
     link = new FakeLink(),
-    { s } = session(["offline"], { links: async () => link, recorder: r });
-  await s.connect();
-  link.events.emitClosed("runtime_gone");
+    { s } = session(["offline"], { link, recorder: r });
+  await s.start();
+  link.events.emitViewer(unreachable("Corgi unreachable: daemon not running"));
+  expect(s.link_state).toBe("lost");
   r.start(path);
   speak(s);
   await until(() => s.history[0]?.status === "recorded");
-  expect(statuses(s)).toEqual([["recorded", "not connected"]]);
+  expect(statuses(s)).toEqual([["recorded", "Corgi unreachable: daemon not running"]]);
+  expect(link.calls).toEqual([]);
   expect(transcript(path)).toBe("offline\n");
   s.close();
 });
@@ -729,7 +723,7 @@ test("a typing backlog never drops a recorded passage from the transcript", asyn
     { s, whisper } = session(["one", "two", "three", "four", "five", "six"], { recorder: r });
   let open!: () => void;
   whisper.gate = new Promise(resolve => (open = resolve));
-  await s.connect();
+  await s.start();
   r.start(path);
   for (let i = 0; i < 6; i++) speak(s);
   expect(statuses(s).map(([status]) => status)).toEqual(Array(6).fill("transcribing"));
@@ -749,7 +743,7 @@ test("past max_queued passages waiting for Whisper, a recorded one is left out a
     { s, whisper } = session(script, { recorder: r });
   let open!: () => void;
   whisper.gate = new Promise(resolve => (open = resolve));
-  await s.connect();
+  await s.start();
   r.start(path);
   for (let i = 0; i <= max_queued; i++) speak(s);
   const last = s.history.at(-1)!;
@@ -767,7 +761,7 @@ test("past max_queued passages waiting for Whisper, a recorded one is left out a
 test("a passage while paused is typed but not written; the next one after resume starts a contribution", async () => {
   const { recorder: r, path } = recorder(),
     { s, link } = session(["before", "aside", "after"], { recorder: r });
-  await s.connect();
+  await s.start();
   r.start(path);
   speak(s);
   await until(() => s.history[0]?.status === "delivered");
@@ -785,7 +779,7 @@ test("a passage while paused is typed but not written; the next one after resume
 test("a passage muted and unmuted while it is said is written but not typed", async () => {
   const { recorder: r, path } = recorder(),
     { s, link } = session(["on and off"], { recorder: r });
-  await s.connect();
+  await s.start();
   r.start(path);
   const pcm = shapes.speech();
   begin(s, pcm);
@@ -801,25 +795,37 @@ test("a passage muted and unmuted while it is said is written but not typed", as
 test("a change in the machine or the reason alone reaches the window", async () => {
   const link = new FakeLink(),
     { s } = session([], { link });
-  await s.connect();
+  await s.start();
   let changes = 0;
   s.on("change", () => changes++);
-  link.events.emitViewer({ viewer: true, focus: "dictation", machine: "marovo", reason: null });
+  link.events.emitViewer({ viewer: true, focus: "dictation", machine: "marovo", reason: null, why: null });
   expect([s.machine, changes]).toEqual(["marovo", 1]);
-  link.events.emitViewer({ viewer: false, focus: null, machine: null, reason: "no viewer attached" });
-  expect([s.viewer, s.reason, changes]).toEqual([false, "no viewer attached", 2]);
-  link.events.emitViewer({ viewer: false, focus: null, machine: null, reason: "Corgi output not understood" });
-  expect([s.reason, changes]).toEqual(["Corgi output not understood", 3]);
+  link.events.emitViewer(seen(false, null));
+  expect([s.viewer, s.reason, s.why, changes]).toEqual([false, "no viewer attached", "no_viewer", 2]);
+  const misread: Seen = {
+    viewer: false,
+    focus: null,
+    machine: null,
+    reason: "Corgi output not understood",
+    why: "not_understood",
+  };
+  link.events.emitViewer(misread);
+  expect([s.reason, s.why, changes]).toEqual(["Corgi output not understood", "not_understood", 3]);
+  // Output that is not understood is no lost link: Corgi answers.
+  expect(s.link_state).toBe("connected");
   // The same view again is no change.
-  link.events.emitViewer({ viewer: false, focus: null, machine: null, reason: "Corgi output not understood" });
+  link.events.emitViewer({ ...misread });
   expect(changes).toBe(3);
 });
 
 test("while Corgi does not answer the link is lost, and back once it does", async () => {
   const link = new FakeLink(),
-    { s } = session(["later"], { link });
-  await s.connect();
-  link.events.emitViewer(seen(false, null, "Corgi unreachable: corgi not found: /x/corgi"));
+    lines: string[] = [],
+    { s } = session(["later"], { link, log: line => lines.push(line) });
+  expect(s.link_state).toBe("connecting");
+  await s.start();
+  expect(s.link_state).toBe("connected");
+  link.events.emitViewer(unreachable("Corgi unreachable: corgi not found: /x/corgi"));
   expect([s.link_state, s.viewer, s.reason]).toEqual(["lost", false, "Corgi unreachable: corgi not found: /x/corgi"]);
   // Nothing is transcribed for dictation meanwhile.
   speak(s);
@@ -830,6 +836,35 @@ test("while Corgi does not answer the link is lost, and back once it does", asyn
   speak(s);
   await until(() => s.history[0]?.status === "delivered");
   expect(link.calls.map(c => c.value)).toEqual(["later"]);
+  // Each change of the link's state is one line in the log.
+  expect(lines.filter(l => l.startsWith("link:"))).toEqual([
+    "link: connected",
+    "link: lost (Corgi unreachable: corgi not found: /x/corgi)",
+    "link: connected",
+  ]);
+});
+
+test("the link's state follows the typed cause, never the words of the reason", async () => {
+  const link = new FakeLink(),
+    { s } = session([], { link });
+  await s.start();
+  // A machine that stopped answering under a viewer: lost, whatever it is called.
+  link.events.emitViewer({ viewer: false, focus: null, machine: null, reason: "gone quiet", why: "unreachable" });
+  expect(s.link_state).toBe("lost");
+  // No viewer, in words that happen to say "unreachable": Corgi answers, so the link is there.
+  link.events.emitViewer({ viewer: false, focus: null, machine: null, reason: "unreachable", why: "no_viewer" });
+  expect(s.link_state).toBe("connected");
+});
+
+test("a missing viewer with those words as its reason is still a plain 'no viewer'", async () => {
+  // The row's text comes from the cause, not from comparing the reason with a known sentence.
+  const link = new FakeLink(),
+    { s } = session(["dropped"], { link });
+  await s.start();
+  const pcm = shapes.speech();
+  for (let at = 0; at < 16000; at += 320) s.frame(pcm.subarray(at, at + 320));
+  link.events.emitViewer({ viewer: false, focus: null, machine: null, reason: "nobody is here", why: "no_viewer" });
+  expect(statuses(s)).toEqual([["discarded", "no viewer"]]);
 });
 
 test("reasons from the link show in the history as they are", async () => {
@@ -840,7 +875,7 @@ test("reasons from the link show in the history as they are", async () => {
     throw Error(reasons[i++]);
   };
   const { s } = session(["first words", "second words", "third words", "fourth words", "fifth words"], { link });
-  await s.connect();
+  await s.start();
   for (let n = 0; n < 3; n++) speak(s);
   await until(() => s.history.filter(u => u.status === "failed").length === 3);
   expect(statuses(s)).toEqual(reasons.map(r => ["failed", r]));
@@ -858,16 +893,55 @@ test("reasons from the link show in the history as they are", async () => {
   expect(s.history[4].reason).toBe("no viewer attached");
 });
 
+test("the session's safety net lies above the link's delivery bound, which decides", () => {
+  expect(deadline_ms).toBe(2000);
+  expect(safety_ms).toBe(2500);
+  expect(safety_ms).toBeGreaterThan(deadline_ms);
+});
+
+test("something thrown where nothing should be fails that utterance alone, is logged, and the next goes on", async () => {
+  const lines: string[] = [],
+    { s, whisper, link } = session(["first", "second", "third"], { log: line => lines.push(line) });
+  await s.start();
+  // Whisper answers with no text at all: cleaning it throws, past every catch of the pipeline.
+  const transcribe = whisper.transcribe.bind(whisper);
+  whisper.transcribe = async () => ({ text: undefined as unknown as string });
+  speak(s);
+  await until(() => s.history[0]?.status === "failed");
+  whisper.transcribe = transcribe;
+  speak(s);
+  await until(() => s.history[1]?.status === "delivered");
+  // A listener that throws as a delivery starts, before the delivery's own catch.
+  let thrown = false;
+  s.on("change", () => {
+    if (!thrown && s.history.at(-1)?.status === "delivering") {
+      thrown = true;
+      throw Error("listener broke");
+    }
+  });
+  speak(s);
+  await until(() => s.history[2]?.status === "failed");
+  expect(s.history[2].reason).toBe("listener broke");
+  speak(s);
+  await until(() => s.history[3]?.status === "delivered");
+  // Neither chain is wedged: what came after each failure was typed.
+  expect(link.calls.map(c => c.value)).toEqual(["first", "third"]);
+  expect(lines.filter(l => l.includes("unexpected error"))).toEqual([
+    expect.stringMatching(/^utterance 1: unexpected error: /),
+    expect.stringMatching(/^utterance 3: unexpected error: Error: listener broke/),
+  ]);
+});
+
 test("the session's own delivery bound is a 2.5 s safety net", async () => {
   const link = new FakeLink();
   link.reply = () => new Promise(() => {});
   const s = new VoiceSession({
-    link: async () => link,
+    link,
     transcriber: new FakeWhisper(["slow"]),
     segmenter: new Segmenter({ threshold: 44, timing: { silence: 0.5 }, now: () => performance.now() }),
     now: () => performance.now(),
   });
-  await s.connect();
+  await s.start();
   speak(s);
   await until(() => s.history[0]?.status === "delivering");
   const started = performance.now();
@@ -880,7 +954,7 @@ test("the session's own delivery bound is a 2.5 s safety net", async () => {
 test("a passage that is only a sound marker is neither written, shown nor typed", async () => {
   const { recorder: r, path } = recorder(),
     { s, link } = session(["*clap*", "(music)", "[laughter]", "real words"], { recorder: r });
-  await s.connect();
+  await s.start();
   r.start(path);
   for (let i = 0; i < 4; i++) speak(s);
   await until(() => s.history.some(u => u.status === "delivered"));
@@ -908,7 +982,7 @@ test("a gauge listens 10 s, then sets the threshold just above the background", 
   const lines: string[] = [],
     clock = { t: 0 },
     { s, segmenter, link } = session(["after the gauge"], { log: line => lines.push(line), now: () => clock.t });
-  await s.connect();
+  await s.start();
   expect(s.startGauge()).toBeNull();
   expect(s.gauge).toEqual({ frames: [], loudest: 0, progress: 0 });
   hum(s, 55.5, 5, clock);
@@ -937,13 +1011,13 @@ test("a gauge sets the threshold through the tuning when one is wired", async ()
     link = new FakeLink(),
     segmenter = new Segmenter({ threshold: 44, now: () => 0 }),
     s = new VoiceSession({
-      link: async () => link,
+      link,
       transcriber: new FakeWhisper([]),
       segmenter,
       now: () => 0,
       setThreshold: pct => set.push(pct),
     });
-  await s.connect();
+  await s.start();
   s.startGauge();
   hum(s, 55.5);
   expect(set).toEqual([58]);
@@ -951,10 +1025,10 @@ test("a gauge sets the threshold through the tuning when one is wired", async ()
 
 test("a gauge replays with the timings in effect, not the defaults", async () => {
   const { s, segmenter } = session([]);
-  await s.connect();
+  await s.start();
   const usual = (() => {
     const t = session([]);
-    void t.s.connect();
+    void t.s.start();
     t.s.startGauge();
     play(t.s, music(10, 7));
     return t.segmenter.percent;
@@ -969,7 +1043,7 @@ test("a gauge replays with the timings in effect, not the defaults", async () =>
 test("quitting during a gauge ends it, with no row and the threshold as it was", async () => {
   const lines: string[] = [],
     { s, segmenter } = session([], { log: line => lines.push(line) });
-  await s.connect();
+  await s.start();
   s.startGauge();
   hum(s, 60, 4);
   s.close();
@@ -981,19 +1055,19 @@ test("quitting during a gauge ends it, with no row and the threshold as it was",
 
 test("without a microphone, or during a recording, a gauge does not start", async () => {
   const { s } = session([]);
-  await s.connect();
+  await s.start();
   s.setAvailable(false, "mic_busy");
   expect(s.startGauge()).toBe("mic_busy");
   expect(s.gauge).toBeNull();
   // A crashed server is no reason: the gauge needs only the microphone.
   const crashed = session([]);
-  await crashed.s.connect();
+  await crashed.s.start();
   crashed.whisper.crash(3);
   expect(crashed.s.startGauge()).toBeNull();
   // A recording has a threshold of its own.
   const { recorder: r, path } = recorder(),
     rec = session([], { recorder: r });
-  await rec.s.connect();
+  await rec.s.start();
   r.start(path);
   expect(rec.s.startGauge()).toBe("recording");
   expect(rec.s.gauge).toBeNull();
@@ -1003,7 +1077,7 @@ test("a gauge drops what is being said, but what Whisper has goes on to be typed
   const { s, whisper, link } = session(["first words", "lost"]);
   let open!: () => void;
   whisper.gate = new Promise(resolve => (open = resolve));
-  await s.connect();
+  await s.start();
   speak(s);
   expect(s.history[0].status).toBe("transcribing");
   const pcm = shapes.speech();
@@ -1029,7 +1103,7 @@ test("mute, a missing viewer or a crashed server do not stop a gauge", async () 
   ];
   for (const [name, upset] of cases) {
     const t = session([]);
-    await t.s.connect();
+    await t.s.start();
     upset(t);
     expect(t.s.startGauge()).toBeNull();
     hum(t.s, 60);
@@ -1041,7 +1115,7 @@ test("mute, a missing viewer or a crashed server do not stop a gauge", async () 
 test("a cancelled gauge leaves no row and the threshold as it was", async () => {
   const lines: string[] = [],
     { s, segmenter, link } = session(["after"], { log: line => lines.push(line) });
-  await s.connect();
+  await s.start();
   s.startGauge();
   hum(s, 70, 4);
   s.cancelGauge();
@@ -1055,7 +1129,7 @@ test("a cancelled gauge leaves no row and the threshold as it was", async () => 
 test("a microphone that fails mid-gauge ends it with a row, and the threshold stays", async () => {
   const lines: string[] = [],
     { s, segmenter } = session([], { log: line => lines.push(line) });
-  await s.connect();
+  await s.start();
   s.startGauge();
   hum(s, 70, 4);
   s.setAvailable(false, "mic_denied");
@@ -1071,7 +1145,7 @@ test("a microphone that fails mid-gauge ends it with a row, and the threshold st
 
 test("music too loud to gauge leaves the threshold, and says so", async () => {
   const { s, segmenter } = session([]);
-  await s.connect();
+  await s.start();
   s.startGauge();
   play(s, tone(10, 0.6));
   expect(s.gauges).toEqual([expect.objectContaining({ old: 44, threshold: 44, loudest: 100, outcome: "too_loud" })]);
@@ -1080,7 +1154,7 @@ test("music too loud to gauge leaves the threshold, and says so", async () => {
 
 test("delivered utterances keep their peak, and a gauge above most of them warns", async () => {
   const { s, segmenter } = session(["one", "two", "three"]);
-  await s.connect();
+  await s.start();
   for (let i = 0; i < 3; i++) speak(s);
   await until(() => s.history.filter(u => u.status === "delivered").length === 3);
   // shapes.speech() is a tone at RMS 0.1.
@@ -1097,7 +1171,7 @@ test("delivered utterances keep their peak, and a gauge above most of them warns
 
 test("only delivered utterances count against a gauge's result", async () => {
   const { s } = session(["loud words", "", ""]);
-  await s.connect();
+  await s.start();
   speak(s);
   for (let i = 0; i < 2; i++) play(s, concat(tone(1.5, level.percentToRms(50.5)), silence(3)));
   await until(() => s.history.filter(u => u.status === "dropped" && u.reason === "empty").length === 2);
@@ -1109,7 +1183,7 @@ test("only delivered utterances count against a gauge's result", async () => {
 
 test("the peak leaves out the pause the cut kept, so a gauge compares speech", async () => {
   const { s, segmenter } = session(["short"]);
-  await s.connect();
+  await s.start();
   // 0.2 s of speech and the whole 2.5 s pause: most of the audio is quiet.
   segmenter.setTiming("silence", 2.5);
   segmenter.setTiming("post_roll", Infinity);
@@ -1123,7 +1197,7 @@ test("the speech filter pads by the post-roll each utterance ended with", async 
   const { s, whisper, segmenter } = session(["one", "two", "three", "four"]);
   let open!: () => void;
   whisper.gate = new Promise(resolve => (open = resolve));
-  await s.connect();
+  await s.start();
   // The default 1 s, within the tests' 0.5 s silence window.
   speak(s);
   speak(s);
@@ -1149,7 +1223,7 @@ test("the log says what the cut kept and where Whisper heard the speech end", as
     { s, whisper, segmenter } = session(["run the tests again", "send", "it"], { log: line => lines.push(line) });
   // The real server reports times such as this one.
   whisper.speech_end = 4.2700000000000005;
-  await s.connect();
+  await s.start();
   speak(s);
   await until(() => s.history[0]?.status === "delivered");
   expect(lines.find(l => l.startsWith("utterance 1:"))).toMatch(
@@ -1174,7 +1248,7 @@ test("the log says what the cut kept and where Whisper heard the speech end", as
 test("an utterance cut at 30 s logs no post-roll, as none was applied", async () => {
   const lines: string[] = [],
     { s } = session(["a long one", ""], { log: line => lines.push(line) });
-  await s.connect();
+  await s.start();
   // The cap comes 0.2 s into the pause, before the 0.5 s window ends it.
   play(s, concat(tone(29.8), silence(1)));
   await until(() => s.history[0]?.status === "delivered");
@@ -1185,7 +1259,7 @@ test("an utterance cut at 30 s logs no post-roll, as none was applied", async ()
 
 test("unmuting waits for a voice that can listen, but restoring the earlier state does not", async () => {
   const { s } = session([]);
-  await s.connect();
+  await s.start();
   s.setMuted(true);
   s.setAvailable(false, "mic_missing");
   s.setMuted(false);
@@ -1213,7 +1287,7 @@ function clocked(script: string[]) {
 
 test("a passage whose speech ended before a pause, in its silence window, is written (FR-004a)", async () => {
   const { s, r, play, a } = clocked(["said before the pause"]);
-  await s.connect();
+  await s.start();
   r.start(a);
   play(concat(tone(1.5), silence(0.2)));
   r.pause();
@@ -1224,7 +1298,7 @@ test("a passage whose speech ended before a pause, in its silence window, is wri
 
 test("a passage whose speech ended before a stop goes to that file, not to one started right after", async () => {
   const { s, r, play, a, b } = clocked(["the last words of a", "the first words of b"]);
-  await s.connect();
+  await s.start();
   r.start(a);
   play(concat(tone(1.5), silence(0.2)));
   const stopped = r.stop()!;
@@ -1238,7 +1312,7 @@ test("a passage whose speech ended before a stop goes to that file, not to one s
 
 test("speech that goes on past a stop is not written to the stopped recording", async () => {
   const { s, r, play, a } = clocked(["still talking"]);
-  await s.connect();
+  await s.start();
   r.start(a);
   play(tone(1));
   const stopped = r.stop()!;
@@ -1250,7 +1324,7 @@ test("speech that goes on past a stop is not written to the stopped recording", 
 
 test("a stop does not wait for, or count as late, speech that goes on past its bound", async () => {
   const { s, r, play, a } = clocked(["kept talking"]);
-  await s.connect();
+  await s.start();
   r.start(a);
   play(tone(1));
   const stopped = r.stop(100)!;
@@ -1263,7 +1337,7 @@ test("a stop does not wait for, or count as late, speech that goes on past its b
 
 test("a stop holding the passage in progress settles at once when that passage is dropped", async () => {
   const { s, r, play, a } = clocked([]);
-  await s.connect();
+  await s.start();
   r.start(a);
   play(tone(0.06));
   const started = Date.now(),
@@ -1276,7 +1350,7 @@ test("a stop holding the passage in progress settles at once when that passage i
 
 test("speech that goes on past a pause is not written to the paused recording", async () => {
   const { s, r, play, a } = clocked(["over the pause"]);
-  await s.connect();
+  await s.start();
   r.start(a);
   play(tone(1));
   r.pause();
@@ -1287,9 +1361,9 @@ test("speech that goes on past a pause is not written to the paused recording", 
 
 test("a passage begun without a viewer and cut loose by a pause keeps its reason and is never transcribed", async () => {
   const { s, r, play, a, link, whisper } = clocked(["never typed"]);
-  await s.connect();
+  await s.start();
   r.start(a);
-  link.events.emitViewer(seen(false, null, "marovo unreachable: no answer in time"));
+  link.events.emitViewer(unreachable("marovo unreachable: no answer in time"));
   play(tone(1));
   expect(s.recording).toBe(true);
   r.pause();
@@ -1305,7 +1379,7 @@ test("a passage begun without a viewer and cut loose by a pause keeps its reason
 
 test("quitting in the silence window of a passage that ended before the stop counts it as left out", async () => {
   const { s, r, play, a } = clocked(["just before quit"]);
-  await s.connect();
+  await s.start();
   r.start(a);
   play(concat(tone(1.5), silence(0.2)));
   void r.stop();
@@ -1319,7 +1393,7 @@ test("quitting in the silence window of a passage that ended before the stop cou
 test("speech that went on past a stop is not late, even when the bound or a quit lands between words", async () => {
   // The stop's bound passes in a short gap of speech that began after the stop.
   const one = clocked(["went on"]);
-  await one.s.connect();
+  await one.s.start();
   one.r.start(one.a);
   one.play(tone(1));
   const stopped = one.r.stop(100)!;
@@ -1327,7 +1401,7 @@ test("speech that went on past a stop is not late, even when the bound or a quit
   expect(await stopped).toEqual({ path: one.a, late: 0 });
   // A second quit press in a short gap of speech that went on 1 s past the stop.
   const two = clocked(["went on too"]);
-  await two.s.connect();
+  await two.s.start();
   two.r.start(two.a);
   two.play(tone(1));
   void two.r.stop();

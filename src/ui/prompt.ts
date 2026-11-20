@@ -6,7 +6,7 @@ import { dirname } from "node:path";
 import * as palette from "./palette";
 import { Style } from "./palette";
 import type { Key } from "./keys";
-import { displayWidth, ellipsis, shortPath } from "../util/text";
+import { displayWidth, ellipsis, shortPath, spaced } from "../util/text";
 import * as transcript from "../voice/transcript";
 
 export type Result = "none" | "accept" | "cancel" | "quit";
@@ -41,7 +41,6 @@ palette.derived(() => {
   warm = new Style({ fg: "warm", bg: "bg" }).sgr();
   field = new Style({ fg: "text", bg: "selected" }).sgr();
 });
-const controls = /[\x00-\x1f\x7f-\x9f]/g;
 
 export class FilePrompt {
   /** The name, one code point per entry, so the caret never splits a character. */
@@ -134,7 +133,7 @@ export class FilePrompt {
   /** Typed or pasted text: keys arrive as latin1 bytes, put back together as
    * UTF-8 here; line breaks and other controls become spaces. */
   private insert(latin1: string): void {
-    const text = this.decoder.decode(Buffer.from(latin1, "latin1"), { stream: true }).replace(controls, " ");
+    const text = spaced(this.decoder.decode(Buffer.from(latin1, "latin1"), { stream: true }));
     const added = [...text];
     this.chars.splice(this.caret, 0, ...added);
     this.caret += added.length;

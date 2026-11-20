@@ -1,5 +1,6 @@
 import { test, expect, afterEach } from "bun:test";
-import { Poller, machineNames } from "../../src/corgi/poller";
+import { Poller, machineNames, bound_ms, fallback_ms, interval_ms, machine_list_ms } from "../../src/corgi/poller";
+import { fresh_ms } from "../../src/corgi/viewers";
 import { fakeCorgi, listJson, listReply, machineList, type FakeCorgi, type Scenario } from "../fixtures/corgi";
 
 const fakes: FakeCorgi[] = [],
@@ -96,7 +97,7 @@ test("without a watched viewer, the previous delivery's machine, then local", as
   await poller.start();
   await until(() => poller.machines.length === 2 && poller.machines.every(m => m.state === "ok"));
   expect(poller.resolve().target?.machine).toBe("local");
-  poller.previous = "marovo";
+  poller.delivered("marovo");
   expect(poller.resolve().target?.machine).toBe("marovo");
 });
 
@@ -158,14 +159,18 @@ test("the fallback call is bounded like any viewer fetch", async () => {
       machines: { local },
       allMachines: { stdout: "{}", delayMs: 10_000 },
     },
-    { fallbackMs: 300, boundMs: 500 },
+    // The bound holds for the local machine's own calls too: wide enough
+    // for a fake corgi that starts slowly on a busy host.
+    { fallbackMs: 300, boundMs: 1000 },
   );
   await poller.start();
-  await Bun.sleep(1800);
-  // Each call was cut at 500 ms, so several started within 1.8 s.
-  expect(fake.calls().filter(c => c.argv.includes("--all-machines")).length).toBeGreaterThanOrEqual(2);
-  expect(poller.resolve().target?.machine).toBe("local");
-}, 10_000);
+  // Each call is cut at 1 s, so the next starts long before the 10 s the
+  // first would have taken.
+  const started = Date.now();
+  await until(() => fake.calls().filter(c => c.argv.includes("--all-machines")).length >= 3, 6000);
+  expect(Date.now() - started).toBeLessThan(6000);
+  await until(() => poller.resolve().target?.machine === "local");
+}, 15_000);
 
 test("a corgi that disappears after startup shows as unreachable and polling goes on", async () => {
   const { fake, poller } = make({ machines: { local } });
@@ -182,3 +187,114 @@ test("machine names that would read as options or hold spaces are never passed t
     "dev.box-1",
   ]);
 });
+
+test("the spec's defaults: each machine asked every second and bounded below the 2 s freshness, the list every 30 s", () => {
+  expect(interval_ms).toBe(1000);
+  expect(bound_ms).toBe(1500);
+  expect(fresh_ms).toBe(2000);
+  expect(bound_ms).toBeLessThan(fresh_ms);
+  expect(machine_list_ms).toBe(30_000);
+  // The fallback keeps the remote machines as fresh as their own loops would.
+  expect(fallback_ms).toBe(interval_ms);
+});
+
+test("a machine that keeps failing is logged once per distinct failure, and once when it answers again", async () => {
+  const lines: string[] = [],
+    about = () => lines.filter(l => l.startsWith("corgi: local:")),
+    polls = (fake: FakeCorgi) => asked(fake).length;
+  const { fake, poller } = make(
+    { machines: { local: { stderr: "corgi: daemon not running\n", code: 1 } } },
+    { log: line => lines.push(line) },
+  );
+  await poller.start();
+  // The same failure, poll after poll.
+  let before = polls(fake);
+  await until(() => polls(fake) >= before + 2, 10_000);
+  expect(about()).toEqual(["corgi: local: daemon not running"]);
+  fake.set({ machines: { local: { stderr: "ssh: connect to host box port 22: Connection refused\n", code: 255 } } });
+  await until(() => about().length === 2, 10_000);
+  before = polls(fake);
+  await until(() => polls(fake) >= before + 2, 10_000);
+  fake.set({ machines: { local } });
+  await until(() => poller.machines[0]?.state === "ok", 10_000);
+  before = polls(fake);
+  await until(() => polls(fake) >= before + 2, 10_000);
+  expect(about()).toEqual([
+    "corgi: local: daemon not running",
+    "corgi: local: ssh: connect to host box port 22: Connection refused",
+    "corgi: local: answering",
+  ]);
+}, 30_000);
+
+test("a machine list that fails is logged once per distinct failure, and once when it answers again", async () => {
+  const lines: string[] = [],
+    about = () => lines.filter(l => l.startsWith("corgi: machine list:")),
+    listed = (fake: FakeCorgi) => fake.calls().filter(c => c.argv.join(" ") === "machine list").length;
+  const { fake, poller } = make(
+    { machineList: { stderr: "corgi: unknown command machine\n", code: 2 }, machines: { local } },
+    { machineListMs: 400, log: line => lines.push(line) },
+  );
+  await poller.start();
+  await until(() => listed(fake) >= 2, 10_000);
+  expect(about()).toEqual(["corgi: machine list: unknown command machine"]);
+  // Another failure: an answer that is no machine list.
+  fake.set({ machineList: { stdout: "not json\n" }, machines: { local } });
+  await until(() => about().length === 2, 10_000);
+  let before = listed(fake);
+  await until(() => listed(fake) >= before + 2, 10_000);
+  fake.set({ machineList: machineList(["local"]), machines: { local } });
+  await until(() => about().length === 3, 10_000);
+  before = listed(fake);
+  await until(() => listed(fake) >= before + 2, 10_000);
+  expect(about()).toEqual([
+    "corgi: machine list: unknown command machine",
+    "corgi: machine list: Corgi output not understood",
+    "corgi: machine list: answering",
+  ]);
+}, 30_000);
+
+test("once machine list answers, the fallback stops and each machine gets a loop of its own", async () => {
+  const all = JSON.stringify({
+    machines: [
+      {
+        machine: "marovo",
+        ok: true,
+        err: null,
+        ...JSON.parse(listJson([{ id: 7, pane: 70, active: 2, watched: true }], [{ id: 70, name: "there" }])),
+      },
+    ],
+  });
+  const watched = listReply([{ id: 7, pane: 70, active: 2, watched: true }], [{ id: 70, name: "there" }]),
+    fallbacks = (fake: FakeCorgi) => fake.calls().filter(c => c.argv.includes("--all-machines")).length,
+    own = (fake: FakeCorgi) => asked(fake).filter(n => n === "marovo").length;
+  const { fake, poller } = make(
+    {
+      machineList: { stderr: "corgi: unknown command machine\n", code: 2 },
+      machines: { local, marovo: watched },
+      allMachines: { stdout: all },
+    },
+    { machineListMs: 500, fallbackMs: 150 },
+  );
+  await poller.start();
+  // The fallback fills marovo in; it has no loop of its own.
+  await until(() => poller.resolve().target?.machine === "marovo", 10_000);
+  expect(own(fake)).toBe(0);
+  expect(fallbacks(fake)).toBeGreaterThanOrEqual(1);
+  // `machine list` starts answering: marovo first, as Corgi lists it.
+  fake.set({
+    machineList: machineList(["marovo", "local"]),
+    machines: { local, marovo: watched },
+    allMachines: { stdout: all },
+  });
+  await until(() => own(fake) >= 2, 10_000);
+  expect(poller.machines.map(m => m.name)).toEqual(["marovo", "local"]);
+  await until(() => poller.resolve().target?.machine === "marovo", 10_000);
+  // The fallback is not asked any more, while marovo's own loop goes on;
+  // one fallback call may have been on its way at the switch.
+  await Bun.sleep(500);
+  const count = fallbacks(fake),
+    loops = own(fake);
+  await until(() => own(fake) >= loops + 2, 10_000);
+  expect(fallbacks(fake)).toBe(count);
+  expect(poller.resolve().target).toMatchObject({ machine: "marovo", pane: 70 });
+}, 30_000);

@@ -3,7 +3,9 @@
 //! Corgi's theme files are never read.
 import { luminance, type Rgb, type Variant } from "./palette";
 
-export type ThemeSetting = "auto" | "light" | "dark";
+/** What the `theme` setting may be; the one definition, which voice.json is checked against. */
+export const theme_settings = ["auto", "light", "dark"] as const;
+export type ThemeSetting = (typeof theme_settings)[number];
 /** How long the terminal has to answer the background query. */
 export const answer_ms = 200;
 const query = "\x1b]11;?\x07";

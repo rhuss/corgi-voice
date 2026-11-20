@@ -8,6 +8,7 @@ import pkg from "../package.json" with { type: "json" };
 import * as errors from "./util/errors";
 import * as log from "./util/log";
 import * as paths from "./util/paths";
+import { spaced } from "./util/text";
 import { migrate } from "./util/migrate";
 import { acquire } from "./util/lock";
 import * as settings from "./voice/settings";
@@ -23,7 +24,6 @@ import { Tuning } from "./voice/tuning";
 import { Recorder } from "./voice/recorder";
 import { Server } from "./voice/whisper";
 import { VoiceSession } from "./voice/session";
-import type { VoiceLink } from "./voice/link";
 import { CorgiLink } from "./corgi/link";
 import { resolveCorgi, checkCapabilities } from "./corgi/command";
 
@@ -190,35 +190,132 @@ export async function main(args: string[], opts: { terminal?: boolean } = {}): P
     mkdirSync(dirname(paths.logFile()), { recursive: true, mode: 0o700 });
     log.configure({ file: paths.logFile(), verbose: true });
   }
-  const logger = log.getLogger("voice");
-  let release = () => {};
+  const logger = log.getLogger("voice"),
+    held: Held = {},
+    end = ending(held, { log: line => logger.info(line) });
   try {
     const cmd = await corgiCommand(s);
     // One corgi-voice at a time, so the same speech is never typed twice.
     const lock = acquire();
     if (!lock.ok) throw Object.assign(Error("AlreadyRunning"), { detail: lock.message });
-    release = lock.release;
-    // A signal or a crash ends the process without the finally below.
-    process.on("exit", release);
-    return await voice(s, cmd, [...taken, ...read.notices], logger, !!given.verbose);
+    held.lock = lock.release;
+    // From the first thing held on, a signal or a crash gives back what there is.
+    end.arm();
+    await voice(s, cmd, [...taken, ...read.notices], logger, !!given.verbose, held);
+    await end.cleanup();
+    return 0;
   } catch (error) {
+    // Nothing may keep running, whisper-server above all; and the terminal
+    // is the user's again before the reason is printed.
+    await end.cleanup();
     logger.error("corgi-voice stopped", { error });
     const detail = (error as { detail?: string }).detail;
     process.stderr.write(`corgi-voice: ${detail ?? message(error, s)}\n`);
     return errors.is(error, "Usage") ? 2 : 1;
   } finally {
-    process.off("exit", release);
-    release();
+    end.disarm();
   }
 }
-/** `verbose`: --verbose, whose log also shows where Whisper heard the speech end. */
+/** What a run holds that must not outlive it. Each is set the moment it is
+ * acquired, so whatever ends corgi-voice gives back exactly what there is. */
+export type Held = {
+  /** Set once the cleanup began: nothing more is to be started. */
+  ended?: boolean;
+  /** Releases the instance lock. */
+  lock?: () => void;
+  /** Stops polling Corgi and kills a delivery in flight. */
+  link?: () => void;
+  /** Stops whisper-server, also one still loading. */
+  server?: () => Promise<void>;
+  /** Stops the microphone's ffmpeg. */
+  capture?: () => void;
+  /** Closes every recording at once; returns each with the passages it left out. */
+  recordings?: () => { path: string; late: number }[];
+  /** Gives the terminal back as it was. */
+  terminal?: () => void;
+};
+/**
+ * The one way corgi-voice ends. `cleanup` gives back what `held` has at that
+ * moment, once (later calls wait for the same run), and one step failing
+ * does not stop the next: the terminal first, so what is printed can be
+ * read; the recordings, closed without waiting, with a line for each that
+ * left passages out; the microphone; the link; whisper-server; the lock last.
+ * `arm` makes SIGINT, SIGTERM, SIGHUP, an uncaught error and an unhandled
+ * rejection run it and exit with status 1, through `signal` and `crash`;
+ * `disarm` is for the normal end, which calls `cleanup` itself. `io` stands
+ * in for the process, for tests.
+ */
+export function ending(
+  held: Held,
+  io: { exit?: (code: number) => void; write?: (text: string) => void; log?: (line: string) => void } = {},
+) {
+  const exit = io.exit ?? ((code: number) => process.exit(code)),
+    write = io.write ?? ((text: string) => void process.stderr.write(text)),
+    attempt = (step: () => void) => {
+      try {
+        step();
+      } catch {}
+    };
+  let done: Promise<void> | null = null;
+  const cleanup = (): Promise<void> =>
+    (done ??= (async () => {
+      held.ended = true;
+      attempt(() => held.terminal?.());
+      attempt(() => {
+        for (const { path, late } of held.recordings?.() ?? []) if (late) write(lateMessage(path, late));
+      });
+      attempt(() => held.capture?.());
+      attempt(() => held.link?.());
+      try {
+        await held.server?.();
+      } catch {}
+      attempt(() => held.lock?.());
+      attempt(() => io.log?.("corgi-voice stopped"));
+    })());
+  const signal = () => void cleanup().finally(() => exit(1)),
+    crash = (error: unknown) => {
+      // The terminal first, so the error lands on the user's own screen.
+      attempt(() => held.terminal?.());
+      attempt(() => write(`corgi-voice: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`));
+      void cleanup().finally(() => exit(1));
+    },
+    // An exit that came some other way, or right after something was
+    // acquired behind a cleanup: what can be given back at once is.
+    exiting = () => {
+      attempt(() => held.terminal?.());
+      void cleanup();
+      attempt(() => held.lock?.());
+    },
+    signals = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
+  return {
+    cleanup,
+    signal,
+    crash,
+    arm(): void {
+      for (const name of signals) process.on(name, signal);
+      process.on("uncaughtException", crash);
+      process.on("unhandledRejection", crash);
+      process.on("exit", exiting);
+    },
+    disarm(): void {
+      for (const name of signals) process.off(name, signal);
+      process.off("uncaughtException", crash);
+      process.off("unhandledRejection", crash);
+      process.off("exit", exiting);
+    },
+  };
+}
+/** The window, from the model's load to the quit key. What it acquires goes
+ * into `held`; the caller cleans up, however this ends. `verbose`: --verbose,
+ * whose log also shows where Whisper heard the speech end. */
 async function voice(
   s: settings.VoiceSettings,
   cmd: string,
   notices: string[],
   logger: log.Logger,
   verbose: boolean,
-): Promise<number> {
+  held: Held,
+): Promise<void> {
   const model = models.catalog[s.model];
   if (!models.installed(model)) throw Error("ModelMissing");
   const binary = setup.onPath("whisper-server");
@@ -230,7 +327,7 @@ async function voice(
     notices = [...notices, "The speech filter is not installed, so noise may become text: run corgi-voice --setup"];
   // The pane corgi-voice runs in, when it runs inside Corgi: never typed into (FR-014).
   const ownPane = ownPaneFrom(process.env);
-  const link = async (): Promise<VoiceLink> => new CorgiLink({ cmd, ownPane, log: line => logger.info(line) });
+  const link = new CorgiLink({ cmd, ownPane, log: line => logger.info(line) });
   const timing = {
       silence: s.silence,
       pre_roll: s.pre_roll,
@@ -280,28 +377,30 @@ async function voice(
     // A gauged threshold goes through the tuning, as + and - do.
     setThreshold: pct => tuning.setThreshold(pct),
   });
+  held.link = () => session.close();
   const muting = muteWhileRecording(session);
-  // The link never fails to start: an unreachable Corgi shows in the window and is retried.
-  await session.connect().catch(() => {});
-  let mic: capture.Capture | null = null,
-    cleaned: Promise<void> | null = null,
-    starting: Promise<Server> | null = null;
+  // After each wait: a signal may have ended corgi-voice meanwhile, and
+  // what is started behind its cleanup would be left running.
+  const going = () => {
+    if (held.ended) throw Error("Aborted");
+  };
+  // An unreachable Corgi is no failure: it shows in the window, and the link
+  // keeps asking. Only a link that cannot start at all ends the run here.
+  await session.start();
+  going();
+  let starting: Promise<Server> | null = null;
   // A whisper-server still loading when corgi-voice ends is stopped too.
   const stopping = new AbortController();
-  const cleanup = () =>
-    (cleaned ??= (async () => {
-      stopping.abort();
-      mic?.stop();
-      session.close();
-      await server?.stop();
-      // A start in progress notices the abort and stops its child; one that
-      // just finished is stopped here. Either way, nothing keeps the port.
-      await starting?.then(
-        started => started.stop(),
-        () => {},
-      );
-      logger.info("corgi-voice stopped");
-    })());
+  held.server = async () => {
+    stopping.abort();
+    await server?.stop();
+    // A start in progress notices the abort and stops its child; one that
+    // just finished is stopped here. Either way, nothing keeps the port.
+    await starting?.then(
+      started => started.stop(),
+      () => {},
+    );
+  };
   const start = async (vad: string | undefined) => {
     const pending = Server.start({
       binary,
@@ -337,7 +436,8 @@ async function voice(
     await old?.stop();
     try {
       const fresh = await start(vadModel);
-      if (cleaned) await fresh.stop();
+      // Started while corgi-voice was ending.
+      if (held.ended) await fresh.stop();
       else {
         server = fresh;
         session.serverReady();
@@ -350,29 +450,22 @@ async function voice(
     }
     return vadModel ? "on" : "off";
   };
-  // Until the window takes the terminal, Ctrl+C or a signal while the model
-  // loads still stops the server, which would otherwise keep the port.
-  const onSignal = () => void cleanup().finally(() => process.exit(1)),
-    signals = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
-  for (const signal of signals) process.on(signal, onSignal);
-  try {
-    server = await start(vadModel);
-    mic = capture.Capture.start(
-      s.device,
-      f => session.frame(f),
-      problem => {
-        logger.warn("microphone", { problem });
-        session.setAvailable(false, problem);
-      },
-    );
-    // Light or dark, before the window reads the keyboard.
-    palette.use(await theme.detect(s.theme));
-  } catch (error) {
-    await cleanup();
-    throw error;
-  } finally {
-    for (const signal of signals) process.off(signal, onSignal);
-  }
+  // Ctrl+C, a signal or a crash while the model loads stops the server,
+  // which would otherwise keep the port: `held.server` is set already.
+  server = await start(vadModel);
+  going();
+  const mic = capture.Capture.start(
+    s.device,
+    f => session.frame(f),
+    problem => {
+      logger.warn("microphone", { problem });
+      session.setAvailable(false, problem);
+    },
+  );
+  held.capture = () => mic.stop();
+  // Light or dark, before the window reads the keyboard.
+  palette.use(await theme.detect(s.theme));
+  going();
   let quit!: () => void;
   const stopped = new Promise<void>(resolve => (quit = resolve)),
     quitting = quitter(recorder, () => view, quit);
@@ -389,7 +482,7 @@ async function voice(
     listDevices: () => capture.listDevices(),
     switchDevice: device => {
       logger.info("microphone switched", { device: device.id });
-      mic?.switch(device.id);
+      mic.switch(device.id);
     },
     quit: quitting.press,
     recorder,
@@ -399,22 +492,11 @@ async function voice(
     startRecording: path => recorder.start(path),
     stopRecording: () => void recorder.stop(),
   });
-  // A signal ends corgi-voice at once; the transcript is closed first.
-  try {
-    await ui.run(view, stopped, async () => {
-      recorder.finish();
-      await cleanup();
-    });
-  } catch (error) {
-    // The window could not start: nothing may keep running, whisper-server above all.
-    recorder.finish();
-    await cleanup();
-    throw error;
-  }
-  const finished = quitting.finish();
-  await cleanup();
-  for (const { path, late } of finished) if (late) process.stderr.write(lateMessage(path, late));
-  return 0;
+  // However corgi-voice ends, by the quit key, a signal or a crash, the
+  // recordings are closed without waiting any longer, and each that left
+  // passages out gets its line.
+  held.recordings = quitting.finish;
+  await ui.run(view, stopped, restore => (held.terminal = restore));
 }
 /** Muting while a recording runs: it records the conversation, not
  * dictation. A recording mutes dictation when it starts; when it ends, the
@@ -470,8 +552,7 @@ export function quitter(
 }
 /** The line on the terminal for passages a recording left out on quit. */
 export function lateMessage(path: string, late: number): string {
-  const shown = path.replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
-  return `corgi-voice: ${late} passage${late === 1 ? "" : "s"} of ${shown} did not finish in time and ${late === 1 ? "is" : "are"} not in the transcript\n`;
+  return `corgi-voice: ${late} passage${late === 1 ? "" : "s"} of ${spaced(path)} did not finish in time and ${late === 1 ? "is" : "are"} not in the transcript\n`;
 }
 
 if (import.meta.main) process.exit(await main(process.argv.slice(2)));

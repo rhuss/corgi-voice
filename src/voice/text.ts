@@ -1,4 +1,5 @@
 //! What Whisper heard, cleaned for typing into a pane.
+import { spaced } from "../util/text";
 
 /** Whole utterances Whisper invents from silence or noise. */
 const hallucinations = new Set([
@@ -13,13 +14,12 @@ const fillers = new Set(["um", "uh", "hmm", "ah", "er"]);
 
 /** The text to type, or null when nothing worth typing is left. */
 export function clean(raw: string): string | null {
-  const text = raw
+  // Whole escape sequences first, then any control character left.
+  const stripped = raw
     .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?/g, " ")
     .replace(/(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]/g, " ")
-    .replace(/\x1b[ -/]*[0-~]?/g, " ")
-    .replace(/[\x00-\x1f\x7f-\x9f]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+    .replace(/\x1b[ -/]*[0-~]?/g, " ");
+  const text = spaced(stripped).replace(/\s+/g, " ").trim();
   // Sounds Whisper describes, as *clap* or [music], alone or beside speech.
   const spoken = text
     .replace(/\*+\S(?:[^*]*\S)?\*+|\[[^\]]*\]/g, " ")

@@ -4,9 +4,13 @@
 //! `corgi machine list`, asked on start and every 30 s. Without it, only the
 //! local machine gets a loop and `list --all-machines --json` fills in the
 //! others every second, bounded like any viewer fetch (it waits for every
-//! machine, so one slow machine leaves the others without data meanwhile). A change in the resolved target, its label or the
-//! reason there is none is announced.
+//! machine, so one slow machine leaves the others without data meanwhile). A
+//! change in the resolved target, its label or the reason there is none is
+//! announced. Each distinct failure, of a machine or of `machine list`, is
+//! logged once, and its recovery once.
 import * as subprocess from "../util/subprocess";
+import { Failure } from "../util/failure";
+import { controls } from "../util/text";
 import { firstLine, notFound } from "./errors";
 import {
   parseReply,
@@ -60,8 +64,9 @@ export function jsonFrom(text: string): unknown {
 }
 /** Whether `name` can go after `--machine` as a value: never an option, no spaces or controls. */
 export function machineName(name: unknown): name is string {
-  return typeof name === "string" && /^[^\s\x00-\x1f\x7f-\x9f-][^\s\x00-\x1f\x7f-\x9f]*$/.test(name);
+  return typeof name === "string" && machine_name.test(name);
 }
+const machine_name = new RegExp(`^[^\\s${controls}-][^\\s${controls}]*$`);
 /** The machine names in a `machine list` reply, or null when it is not one. */
 export function machineNames(text: string): string[] | null {
   const reply = jsonFrom(text) as { machines?: unknown } | null;
@@ -75,10 +80,11 @@ export function machineNames(text: string): string[] | null {
 }
 
 export class Poller {
-  /** The machines in Corgi's listing order. */
-  machines: Machine[] = [];
+  private list: Machine[] = [];
   /** The machine of the last successful delivery, for the tie-break. */
-  previous: string | null = null;
+  private previous: string | null = null;
+  /** What `machine list` last failed with, so each failure is logged once. */
+  private listing_failure = new Failure();
   private loops = new Map<string, Loop>();
   private listeners: ((r: Resolution) => void)[] = [];
   private shown: string | null = null;
@@ -121,9 +127,17 @@ export class Poller {
   on(_event: "change", fn: (r: Resolution) => void): void {
     this.listeners.push(fn);
   }
+  /** The machines in Corgi's listing order. */
+  get machines(): readonly Machine[] {
+    return this.list;
+  }
   /** The target now, from the newest data of every machine. */
   resolve(): Resolution {
-    return resolve(this.machines, this.previous, this.now());
+    return resolve(this.list, this.previous, this.now());
+  }
+  /** A delivery to `machine` succeeded: it wins the next tie between machines. */
+  delivered(machine: string): void {
+    this.previous = machine;
   }
   /** Stops every loop and kills the calls in flight. */
   stop(): void {
@@ -137,15 +151,23 @@ export class Poller {
   /** Asks `machine list` and gives each listed machine a loop, dropping the
    * machines no longer listed. Without an answer, falls back to `--all-machines`. */
   private async refresh(): Promise<void> {
-    let names: string[] | null = null;
+    let names: string[] | null = null,
+      why: string | null = null;
     try {
       const out = await subprocess.run([this.cmd, "machine", "list"], {
         timeoutMs: slow_bound_ms,
         signal: this.abort.signal,
       });
-      if (!out.timedOut && out.code === 0) names = machineNames(out.stdout);
-    } catch {}
+      if (out.timedOut) why = "no answer in time";
+      else if (out.code !== 0) why = firstLine(out.stderr, out.code);
+      else if (!(names = machineNames(out.stdout))) why = not_understood;
+    } catch (error) {
+      why = unstarted(this.cmd, error);
+    }
     if (this.stopped) return;
+    if (why !== null) {
+      if (this.listing_failure.changed(why)) this.log(`corgi: machine list: ${why}`);
+    } else if (this.listing_failure.clear()) this.log("corgi: machine list: answering");
     if (!names) {
       // The machines known so far keep their loops until a list says otherwise.
       if (this.order === null && !this.falling) {
@@ -158,7 +180,7 @@ export class Poller {
       this.falling = false;
       clearTimeout(this.fallback);
       // Machines the fallback filled in get loops of their own now.
-      this.machines = this.machines.filter(m => this.loops.has(m.name));
+      this.list = this.list.filter(m => this.loops.has(m.name));
     }
     if (this.order === null || this.order.join("\n") !== names.join("\n")) this.log(`corgi: machines ${names.join(", ")}`);
     this.order = names;
@@ -170,7 +192,7 @@ export class Poller {
   /** Keeps `machines` in the listing's order; local, when unlisted, first. */
   private sort(): void {
     const order = this.order ?? [];
-    this.machines.sort((a, b) => order.indexOf(a.name) - order.indexOf(b.name));
+    this.list.sort((a, b) => order.indexOf(a.name) - order.indexOf(b.name));
   }
   /** `list --all-machines --json`: every machine but the local one, which has
    * its own loop. Its exit code counts for nothing when its JSON parses. */
@@ -195,12 +217,12 @@ export class Poller {
         name = machineName(e?.machine) ? e.machine : null;
       if (!e || !name || name === "local") continue;
       listed.add(name);
-      let m = this.machines.find(x => x.name === name);
-      if (!m) this.machines.push((m = blank(name)));
+      let m = this.list.find(x => x.name === name);
+      if (!m) this.list.push((m = blank(name)));
       if (e.ok === false) this.fail(m, typeof e.err === "string" ? e.err : "unreachable");
       else this.take(m, e);
     }
-    this.machines = this.machines.filter(m => listed.has(m.name));
+    this.list = this.list.filter(m => listed.has(m.name));
     this.evaluate();
   }
   /** The next `--all-machines` call, an interval after the last one started. */
@@ -211,9 +233,9 @@ export class Poller {
   /** Starts a loop for `name`; resolves after its first poll. */
   private add(name: string): Promise<void> {
     if (this.loops.has(name) || this.stopped) return Promise.resolve();
-    const machine = this.machines.find(m => m.name === name) ?? blank(name),
+    const machine = this.list.find(m => m.name === name) ?? blank(name),
       loop: Loop = { machine, abort: new AbortController(), stopped: false };
-    if (!this.machines.includes(machine)) this.machines.push(machine);
+    if (!this.list.includes(machine)) this.list.push(machine);
     this.loops.set(name, loop);
     return this.run(loop);
   }
@@ -225,7 +247,7 @@ export class Poller {
     loop.abort.abort();
     clearTimeout(loop.timer);
     this.loops.delete(name);
-    this.machines = this.machines.filter(m => m !== loop.machine);
+    this.list = this.list.filter(m => m !== loop.machine);
     if (!this.stopped) this.log(`corgi: ${name} no longer listed`);
   }
   private async run(loop: Loop): Promise<void> {
@@ -247,8 +269,7 @@ export class Poller {
       });
     } catch (error) {
       if (loop.stopped) return;
-      const name = (error as Error)?.message;
-      this.fail(m, name === "FileNotFound" || name === "AccessDenied" ? notFound(this.cmd) : String(name));
+      this.fail(m, unstarted(this.cmd, error));
       return;
     }
     if (loop.stopped) return;
@@ -288,6 +309,11 @@ export class Poller {
     this.shown = key;
     for (const fn of this.listeners) fn(r);
   }
+}
+/** Why `cmd` could not be run at all: not found, or what the spawn failed with. */
+function unstarted(cmd: string, error: unknown): string {
+  const name = (error as Error)?.message;
+  return name === "FileNotFound" || name === "AccessDenied" ? notFound(cmd) : String(name);
 }
 /** The `err` of a reply with `ok: false`, if that is what `reply` is. */
 function refused(reply: unknown): string | null {

@@ -51,8 +51,8 @@ Where to look and what to check when reviewing this branch by hand:
 |----------|-------|-------|-----------|
 | Critical | 0 | 0 | 0 |
 | Important | 19 | 17 | 0 (1 dismissed, 1 accepted: FINDING-19 lock race, see resolution below) |
-| Minor | 40 | 19 | 20 |
-| Notable | 7 | - | 7 |
+| Minor | 40 | 39 | 0 (20 fixed after merge, 2026-11-20) |
+| Notable | 7 | 2 | 5 (NOTABLE-1 queue guard and NOTABLE-2 single delivery bound fixed after merge) |
 
 Dismissed with rationale (not fixed, not remaining): Codex P1 (macOS `:default` capture device, identical to the source and confirmed by the walkthrough), Codex P2 (tighten permissions of an existing transcript; the 005 spec keeps existing file permissions).
 

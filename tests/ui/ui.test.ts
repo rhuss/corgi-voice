@@ -2,6 +2,7 @@ import { test, expect, afterEach } from "bun:test";
 import { VoiceUi, problem, type Options } from "../../src/ui/ui";
 import { clock } from "../../src/voice/reading";
 import { VoiceSession, type Utterance } from "../../src/voice/session";
+import type { VoiceLink } from "../../src/voice/link";
 import { Segmenter, default_timing } from "../../src/voice/segmenter";
 import type { Device } from "../../src/voice/capture";
 import * as palette from "../../src/ui/palette";
@@ -38,11 +39,18 @@ function screen(frame: string, cols: number, rows: number): string[] {
   }
   return grid.map(r => r.join(""));
 }
+/** A link that is never started: each test sets what the session would have seen. */
+const idle: VoiceLink = {
+  watch: () => new Promise(() => {}),
+  type: async () => {
+    throw Error("NoViewer");
+  },
+  on: () => {},
+  close: () => {},
+};
 function setup(opts: Partial<Options> = {}) {
   const session = new VoiceSession({
-      link: async () => {
-        throw Error("NotConnected");
-      },
+      link: idle,
       transcriber: { transcribe: async () => ({ text: "" }), on: () => {} },
       segmenter: new Segmenter({ threshold: 44, now: () => 0 }),
       now: () => 0,
@@ -165,13 +173,14 @@ test("muted, unavailable and disconnected states say so", () => {
   session.setAvailable(false, "mic_busy");
   let rows = screen(ui.draw(80, 20), 80, 20);
   expect(rows[0]).toStartWith(" ○ Corgi Voice");
-  // A voice that cannot listen counts as muted, as in the sidebar.
+  // A voice that cannot listen counts as muted.
   expect(rows[3]).toContain("Mode:    MUTED");
   expect(rows[9]).toContain("The microphone is in use by another program");
   session.setAvailable(true, null);
   session.link_state = "lost";
   session.viewer = false;
   session.reason = "Corgi unreachable: daemon not running";
+  session.why = "unreachable";
   rows = screen(ui.draw(80, 20), 80, 20);
   expect(rows[9]).toContain("Corgi unreachable: daemon not running; retrying every second");
   expect(rows[2]).toContain("Target:  Corgi unreachable");
@@ -196,7 +205,7 @@ test("the mode is MUTED or Listening; the note adds a missing viewer and what sp
   expect(shown().frame).toContain(palette.fgRgb(green) + "♫");
   session.history = [];
   const grey = new Style({ fg: "muted", bg: "bg" }).sgr() + "♫";
-  // Not connected to the runtime: the note stays grey, whatever the link is doing.
+  // Corgi has not answered yet, or stopped answering: the note stays grey either way.
   for (const state of ["connecting", "lost"] as const) {
     session.link_state = state;
     expect(shown()).toMatchObject({ note: "♫", mode: "Listening" });
@@ -654,13 +663,19 @@ test("while quitting waits for the transcript, the status line says so", () => {
 
 test("a passage written but not typed shows as recorded, with why unless it was the mute", () => {
   const { ui, session, recorder } = recording();
-  session.history = [said(1, "recorded", "a call", "muted"), said(2, "recorded", "and more", "no viewer attached")];
+  session.history = [
+    { ...said(1, "recorded", "a call", "muted"), untyped: "muted" },
+    { ...said(2, "recorded", "and more", "no viewer attached"), untyped: "no_viewer" },
+    // The cause decides, not the words: a passage not typed for another reason that reads "muted" still says so.
+    said(4, "recorded", "odd one", "muted"),
+  ];
   const rows = screen(ui.draw(80, 20), 80, 20).join("\n"),
     at = clock(0);
   // Muted is what a recording does by itself: the mark alone says it was written, not typed.
   expect(rows.split("\n").map(r => r.trim())).toContain(`● ${at} a call`);
-  expect(rows).not.toContain("(muted)");
+  expect(rows).not.toContain("a call · recorded");
   expect(rows).toContain(`● ${at} and more · recorded, not typed (no viewer attached)`);
+  expect(rows).toContain(`● ${at} odd one · recorded, not typed (muted)`);
   // No answer to the typing: written, and perhaps typed, so it does not claim otherwise.
   session.history = [
     { ...said(3, "recorded", "slow", "no answer in time; may have been typed"), maybe_typed: true },
@@ -744,12 +759,19 @@ test("without a viewer the status says why: none attached, or Corgi not understo
   const { session, ui } = setup();
   session.viewer = false;
   session.reason = "no viewer attached";
+  session.why = "no_viewer";
   let rows = screen(ui.draw(80, 20), 80, 20);
   expect(rows[2]).toContain("Target:  no viewer attached");
   expect(rows[9]).toContain("No Corgi window is attached; nothing is typed until one is");
   session.reason = "Corgi output not understood";
+  session.why = "not_understood";
   rows = screen(ui.draw(80, 20), 80, 20);
   expect(rows[9]).toContain("Corgi output not understood; nothing is typed until Corgi answers");
+  // The cause decides, not the words: any reason of a plain missing viewer reads the same.
+  session.reason = "nobody is here";
+  session.why = "no_viewer";
+  rows = screen(ui.draw(80, 20), 80, 20);
+  expect(rows[9]).toContain("No Corgi window is attached; nothing is typed until one is");
 });
 
 test("a machine a viewer shows that stopped answering is named in the target and the status", () => {
@@ -757,6 +779,7 @@ test("a machine a viewer shows that stopped answering is named in the target and
   session.viewer = false;
   session.link_state = "lost";
   session.reason = "marovo unreachable: RequestTimedOut";
+  session.why = "unreachable";
   const rows = screen(ui.draw(80, 20), 80, 20);
   expect(rows[2]).toContain("Target:  marovo unreachable");
   expect(rows[9]).toContain("marovo unreachable: RequestTimedOut; retrying every second");

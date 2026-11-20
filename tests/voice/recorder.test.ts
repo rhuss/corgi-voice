@@ -1,8 +1,8 @@
-import { test, expect, afterEach } from "bun:test";
+import { test, expect, afterEach, spyOn } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, mkdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Recorder } from "../../src/voice/recorder";
+import { Recorder, stop_wait_ms } from "../../src/voice/recorder";
 import type { Tuning } from "../../src/voice/tuning";
 import type { Utterance } from "../../src/voice/session";
 import * as settings from "../../src/voice/settings";
@@ -108,6 +108,28 @@ test("stop waits for pending passages, and a late one is left out", async () => 
   expect(lines.at(-1)).toMatch(/late=1$/);
 });
 
+test("a stop waits 10 s for its pending passages unless told otherwise", async () => {
+  expect(stop_wait_ms).toBe(10_000);
+  const { recorder } = setup(),
+    path = join(folder(), "t.txt");
+  recorder.start(path);
+  const pending = passage(0, 1000);
+  recorder.claim(pending);
+  // The wait is a timer: its delay is the bound.
+  const timers = spyOn(globalThis, "setTimeout");
+  let delays: unknown[];
+  try {
+    const stopping = recorder.stop();
+    delays = timers.mock.calls.map(call => call[1]);
+    // Quitting ends the wait at once; the passage counts as left out.
+    expect(recorder.finish()).toEqual([{ path, late: 1 }]);
+    expect(await stopping).toEqual({ path, late: 1 });
+  } finally {
+    timers.mockRestore();
+  }
+  expect(delays).toEqual([10_000]);
+});
+
 test("stop resolves at once when every pending passage is released", async () => {
   const { recorder } = setup(),
     path = join(folder(), "t.txt");
@@ -170,7 +192,7 @@ test("passages a write error leaves unwritten count as left out", async () => {
   expect(recorder.write(second, "Never.")).toBe(false);
 });
 
-test("voice mode hears when a recording begins and ends, by a stop or a write failure, once each", () => {
+test("corgi-voice hears when a recording begins and ends, by a stop or a write failure, once each", () => {
   const { recorder, active } = setup(),
     dir = folder();
   // A refused start begins nothing.

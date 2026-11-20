@@ -14,18 +14,37 @@ let fake: FakeCorgi;
 let dir = "",
   served: Record<string, Uint8Array<ArrayBuffer>> = {},
   requests: string[] = [],
+  /** Called halfway through a file's download, the first half sent, when set. */
+  midway: (() => Promise<void>) | null = null,
   server: ReturnType<typeof Bun.serve>;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "corgi-setup-"));
-  process.env.XDG_CACHE_HOME = join(dir, "cache");
+  // The process's own cache is somewhere else than the one setup is given:
+  // whatever read or wrote there would not have taken the injected env.
+  process.env.XDG_CACHE_HOME = join(dir, "not-the-given-cache");
   fake = fakeCorgi();
   requests = [];
+  midway = null;
   server = Bun.serve({
     port: 0,
     fetch(request) {
-      const name = new URL(request.url).pathname.slice(1);
+      const name = new URL(request.url).pathname.slice(1),
+        data = served[name],
+        pause = midway;
       requests.push(name);
-      return served[name] ? new Response(served[name]) : new Response("missing", { status: 404 });
+      if (!data) return new Response("missing", { status: 404 });
+      if (!pause) return new Response(data);
+      const half = Math.floor(data.length / 2);
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          async start(controller) {
+            controller.enqueue(data.subarray(0, half));
+            await pause();
+            controller.enqueue(data.subarray(half));
+            controller.close();
+          },
+        }),
+      );
     },
   });
 });
@@ -48,7 +67,7 @@ function entry(name: "base.en" | "filter", content: string, sha256?: string): mo
   };
 }
 /** Old and new files under the test's folder only. */
-const env = () => ({
+const env = (): NodeJS.ProcessEnv => ({
   HOME: dir,
   XDG_STATE_HOME: join(dir, "state"),
   XDG_CACHE_HOME: join(dir, "cache"),
@@ -72,8 +91,11 @@ test("missing files are downloaded, verified and renamed into place", async () =
   expect(out).toContain("downloading model base.en");
   expect(out).toContain("100%");
   expect(out).toContain("Voice is ready");
-  expect(readFileSync(models.fileOf(entries.model), "utf8")).toBe("model bytes");
-  expect(existsSync(models.fileOf(entries.model) + ".part")).toBe(false);
+  const file = models.fileOf(entries.model, env());
+  expect(file).toBe(join(dir, "cache", "corgi-voice", entries.model.file));
+  expect(out).toContain(`[ok] model base.en ${file}`);
+  expect(readFileSync(file, "utf8")).toBe("model bytes");
+  expect(existsSync(file + ".part")).toBe(false);
   expect(requests).toEqual(["base.en", "filter"]);
   // A second run has nothing to fetch.
   const again = await report(entries);
@@ -82,19 +104,40 @@ test("missing files are downloaded, verified and renamed into place", async () =
   expect(requests).toHaveLength(2);
 });
 
+test("setup reads and writes the one cache its env names, never the process's own", async () => {
+  const entries = { model: entry("base.en", "model bytes"), filter: entry("filter", "filter bytes") },
+    own = process.env.XDG_CACHE_HOME!;
+  expect(models.cacheDir()).toBe(join(own, "corgi-voice"));
+  expect(models.cacheDir(env())).toBe(join(dir, "cache", "corgi-voice"));
+  expect((await report(entries)).code).toBe(0);
+  // Downloaded into the given cache, and found there by the next run.
+  expect(models.installed(entries.model, env())).toBe(true);
+  expect(models.installed(entries.filter, env())).toBe(true);
+  expect(models.installed(entries.model)).toBe(false);
+  expect(existsSync(own)).toBe(false);
+  expect((await report(entries)).out).not.toContain("downloading");
+  // A model in the process's own cache counts for nothing here.
+  mkdirSync(join(own, "corgi-voice"), { recursive: true });
+  writeFileSync(join(own, "corgi-voice", "ggml-base.en.bin"), "model bytes");
+  rmSync(join(dir, "cache"), { recursive: true });
+  const fresh = await report(entries);
+  expect(fresh.out).toContain("downloading model base.en");
+  expect(requests).toHaveLength(4);
+});
+
 test("a download that does not match its checksum is deleted", async () => {
   const entries = { model: entry("base.en", "model bytes", "0".repeat(64)), filter: entry("filter", "filter") };
   const { code, out } = await report(entries);
   expect(code).toBe(1);
   expect(out).toContain("[failed] model base.en: the download did not match its checksum");
-  expect(existsSync(models.fileOf(entries.model))).toBe(false);
-  expect(existsSync(models.fileOf(entries.model) + ".part")).toBe(false);
+  expect(existsSync(models.fileOf(entries.model, env()))).toBe(false);
+  expect(existsSync(models.fileOf(entries.model, env()) + ".part")).toBe(false);
   expect(out).toContain("[ok] speech filter");
 });
 
 test("a download that cannot be written fails instead of hanging", async () => {
   const entries = { model: entry("base.en", "model bytes"), filter: entry("filter", "filter") },
-    cache = dirname(models.fileOf(entries.model));
+    cache = dirname(models.fileOf(entries.model, env()));
   mkdirSync(cache, { recursive: true });
   chmodSync(cache, 0o500);
   try {
@@ -104,7 +147,7 @@ test("a download that cannot be written fails instead of hanging", async () => {
   } finally {
     chmodSync(cache, 0o755);
   }
-  expect(existsSync(models.fileOf(entries.model) + ".part")).toBe(false);
+  expect(existsSync(models.fileOf(entries.model, env()) + ".part")).toBe(false);
 });
 
 test("missing tools are reported with how to install them", async () => {
@@ -166,4 +209,48 @@ test("models of the in-Corgi voice mode are taken before anything is downloaded"
   // Only the filter was missing from both caches.
   expect(requests).toEqual(["filter"]);
   expect(existsSync(join(dir, "state", "corgi-voice", "voice.json"))).toBe(true);
+});
+
+test("a model of the old cache whose checksum does not match is not taken: it is downloaded", async () => {
+  const entries = { model: entry("base.en", "model bytes"), filter: entry("filter", "filter bytes") },
+    old = join(dir, "cache", "corgi", "voice");
+  mkdirSync(old, { recursive: true });
+  // The pinned size, another content.
+  writeFileSync(join(old, entries.model.file), "MODEL BYTES");
+  const { code, out } = await report(entries);
+  expect(code).toBe(0);
+  expect(out).toContain(`[taken] Did not take ${entries.model.file} from ${old}: its checksum does not match`);
+  expect(out).not.toContain(`Took ${entries.model.file}`);
+  expect(requests).toEqual(["base.en", "filter"]);
+  expect(readFileSync(models.fileOf(entries.model, env()), "utf8")).toBe("model bytes");
+  expect(readFileSync(join(old, entries.model.file), "utf8")).toBe("MODEL BYTES");
+});
+
+test("a partial model in the new cache is not taken over; setup downloads it through .part and replaces it", async () => {
+  const entries = { model: entry("base.en", "the whole model, every byte"), filter: entry("filter", "filter bytes") },
+    old = join(dir, "cache", "corgi", "voice"),
+    file = models.fileOf(entries.model, env()),
+    part = file + ".part";
+  // The old cache has the whole model; the new one a file that is too short.
+  mkdirSync(old, { recursive: true });
+  writeFileSync(join(old, entries.model.file), "the whole model, every byte");
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, "the whole mo");
+  // Halfway through the model's download: what is on disk then.
+  let during = null as { part: boolean; file: string } | null;
+  midway = async () => {
+    if (during) return;
+    for (let i = 0; i < 200 && !existsSync(part); i++) await Bun.sleep(10);
+    during = { part: existsSync(part), file: readFileSync(file, "utf8") };
+  };
+  const { code, out } = await report(entries);
+  expect(code).toBe(0);
+  // Migration left the partial file as it was, and linked nothing over it.
+  expect(out).not.toContain("[taken]");
+  expect(requests).toEqual(["base.en", "filter"]);
+  // The download went beside it, and took its place only when whole and checked.
+  expect(during).toEqual({ part: true, file: "the whole mo" });
+  expect(readFileSync(file, "utf8")).toBe("the whole model, every byte");
+  expect(existsSync(part)).toBe(false);
+  expect(out).toContain(`[ok] model base.en ${file}`);
 });

@@ -1,6 +1,7 @@
-//! Short-lived helper processes on `Bun.spawn`, each bounded: a call that
-//! runs past its bound (or is aborted) gets SIGTERM, then SIGKILL 200 ms
-//! later, and `run` settles only after the process has exited.
+//! Short-lived helper processes on `Bun.spawn`, each bounded by a time, an
+//! abort signal or both: a call that runs past its bound (or is aborted)
+//! gets SIGTERM, then SIGKILL 200 ms later, and `run` settles only after the
+//! process has exited.
 
 export type Result = {
   /** Exit code, or null when a signal ended the process. */
@@ -13,7 +14,8 @@ export type Result = {
 export type Options = {
   /** Written to the process's stdin, which is then closed. Without it stdin is closed at once. */
   stdin?: string;
-  timeoutMs: number;
+  /** The bound, in ms. Left out, only `signal` ends the call: its owner keeps the time. */
+  timeoutMs?: number;
   env?: Record<string, string | undefined>;
   cwd?: string;
   /** Aborting kills the process as a timeout does. */
@@ -60,8 +62,9 @@ function collect(stream: ReadableStream<Uint8Array>) {
   };
 }
 
-/** Runs `argv` to completion within `timeoutMs`. Throws `spawnError(...)`
- * when the program cannot start (`FileNotFound` for a missing one). */
+/** Runs `argv` to completion within `timeoutMs`, or until `signal` aborts.
+ * Throws `spawnError(...)` when the program cannot start (`FileNotFound` for
+ * a missing one). */
 export async function run(argv: string[], opts: Options): Promise<Result> {
   if (opts.signal?.aborted) return { code: null, stdout: "", stderr: "", timedOut: true };
   let child: ReturnType<typeof Bun.spawn<"pipe", "pipe", "pipe">>;
@@ -94,7 +97,7 @@ export async function run(argv: string[], opts: Options): Promise<Result> {
   };
   // The bound and the abort hold from the spawn on, so a child that never
   // reads its input (or an abort while it is written) cannot outlive them.
-  const timer = setTimeout(stop, opts.timeoutMs);
+  const timer = opts.timeoutMs === undefined ? undefined : setTimeout(stop, opts.timeoutMs);
   opts.signal?.addEventListener("abort", stop, { once: true });
   if (opts.signal?.aborted) stop();
   const stdout = collect(child.stdout),

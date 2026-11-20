@@ -1,8 +1,21 @@
 import { test, expect, afterEach } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { closeSync, existsSync, ftruncateSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { flags, message, quitter, lateMessage, muteWhileRecording, usage, version, main, ownPaneFrom } from "../src/main";
+import { dirname, join, resolve } from "node:path";
+import {
+  flags,
+  message,
+  quitter,
+  lateMessage,
+  muteWhileRecording,
+  usage,
+  version,
+  main,
+  ownPaneFrom,
+  ending,
+  type Held,
+} from "../src/main";
+import * as models from "../src/voice/models";
 import { fakeCorgi } from "./fixtures/corgi";
 import * as paths from "../src/util/paths";
 import { acquire, type Lock } from "../src/util/lock";
@@ -129,7 +142,7 @@ test("--transcripts names the folder for one run; it needs a value", () => {
   expect(() => flags(["--transcripts"])).toThrow("Usage");
 });
 
-// What reaches the runtime during a recording is checked in session.test.ts.
+// What reaches Corgi during a recording is checked in corgi/integration.test.ts.
 test("--transcripts wins over voice.json and resolves against the start folder", () => {
   const env = { HOME: "/home/me" },
     folder = (args: string[]) =>
@@ -341,3 +354,258 @@ test("stopping a recording restores the earlier unmuted state even while voice c
     [false, true],
   ]);
 });
+
+/** An ending whose exit and stderr the test keeps, over `held`. */
+function end(held: Held) {
+  const written: string[] = [],
+    exits: number[] = [],
+    logged: string[] = [];
+  return {
+    written,
+    exits,
+    logged,
+    ...ending(held, {
+      exit: code => void exits.push(code),
+      write: text => void written.push(text),
+      log: line => void logged.push(line),
+    }),
+  };
+}
+
+test("the cleanup gives back what is held, once: terminal, recordings, microphone, link, server, lock", async () => {
+  const order: string[] = [],
+    held: Held = {
+      lock: () => void order.push("lock"),
+      link: () => void order.push("link"),
+      server: async () => {
+        order.push("server stopping");
+        await Bun.sleep(20);
+        order.push("server stopped");
+      },
+      capture: () => void order.push("capture"),
+      recordings: () => (order.push("recordings"), []),
+      terminal: () => void order.push("terminal"),
+    },
+    e = end(held);
+  const first = e.cleanup();
+  // What needs no waiting is done before the call returns: the terminal above all.
+  expect(order).toEqual(["terminal", "recordings", "capture", "link", "server stopping"]);
+  expect(held.ended).toBe(true);
+  // A second call, while it runs or after, starts nothing again.
+  await Promise.all([first, e.cleanup()]);
+  await e.cleanup();
+  expect(order).toEqual(["terminal", "recordings", "capture", "link", "server stopping", "server stopped", "lock"]);
+  expect(e.logged).toEqual(["corgi-voice stopped"]);
+  expect(e.exits).toEqual([]);
+});
+
+test("the cleanup takes what is held when it runs, and a step that fails does not stop the next", async () => {
+  const order: string[] = [],
+    held: Held = { lock: () => void order.push("lock") },
+    e = end(held);
+  // Acquired after the handlers were armed, as each resource is.
+  held.link = () => {
+    throw Error("link broke");
+  };
+  held.server = async () => {
+    order.push("server");
+    throw Error("server broke");
+  };
+  held.terminal = () => {
+    throw Error("terminal broke");
+  };
+  await e.cleanup();
+  expect(order).toEqual(["server", "lock"]);
+});
+
+test("a signal runs the cleanup, then exits with status 1", async () => {
+  const order: string[] = [],
+    e = end({
+      server: async () => {
+        await Bun.sleep(10);
+        order.push("server");
+      },
+      lock: () => void order.push("lock"),
+    });
+  e.signal();
+  expect(e.exits).toEqual([]);
+  await e.cleanup();
+  await Bun.sleep(0);
+  expect(order).toEqual(["server", "lock"]);
+  expect(e.exits).toEqual([1]);
+});
+
+test("a crash gives the terminal back before the error is printed, cleans up, and exits with status 1", async () => {
+  const order: string[] = [],
+    held: Held = {
+      terminal: () => void order.push("terminal"),
+      server: async () => void order.push("server"),
+      lock: () => void order.push("lock"),
+    },
+    written: string[] = [],
+    exits: number[] = [],
+    e = ending(held, {
+      exit: code => void exits.push(code),
+      write: text => {
+        order.push("error printed");
+        written.push(text);
+      },
+    });
+  e.crash(Error("the model broke"));
+  expect(order.slice(0, 2)).toEqual(["terminal", "error printed"]);
+  expect(written.join("")).toStartWith("corgi-voice: Error: the model broke");
+  await e.cleanup();
+  await Bun.sleep(0);
+  expect(order).toEqual(["terminal", "error printed", "terminal", "server", "lock"]);
+  expect(exits).toEqual([1]);
+  // Something that is no Error is printed as it is.
+  const other = end({});
+  other.crash("just a string");
+  expect(other.written).toEqual(["corgi-voice: just a string\n"]);
+});
+
+test("armed, the signals, uncaught errors and unhandled rejections all end through the cleanup; disarmed, none do", () => {
+  const events = ["SIGINT", "SIGTERM", "SIGHUP", "uncaughtException", "unhandledRejection", "exit"] as const,
+    counts = () => events.map(name => process.listenerCount(name)),
+    before = counts(),
+    e = end({});
+  e.arm();
+  expect(counts()).toEqual(before.map(n => n + 1));
+  e.disarm();
+  expect(counts()).toEqual(before);
+});
+
+test("a signal during a recording closes it without the wait and prints the passages left out", async () => {
+  const { recorder, path, q } = busy(),
+    e = end({ recordings: q.finish }),
+    started = performance.now();
+  e.signal();
+  await e.cleanup();
+  await Bun.sleep(0);
+  // Closed at once, not after the 10 s a stop would wait for the passage.
+  expect(performance.now() - started).toBeLessThan(1000);
+  expect([recorder.current, recorder.stopping.size]).toEqual([null, 0]);
+  expect(e.written).toEqual([lateMessage(path, 1)]);
+  expect(e.exits).toEqual([1]);
+});
+
+test("a signal after a stop, while a passage is awaited, prints the same line; with none left out, nothing", async () => {
+  const waiting = busy(),
+    e = end({ recordings: waiting.q.finish });
+  // R was pressed: the recording waits for its passage.
+  void waiting.recorder.stop();
+  expect(waiting.recorder.stopping.size).toBe(1);
+  e.signal();
+  await e.cleanup();
+  expect(e.written).toEqual([lateMessage(waiting.path, 1)]);
+  // Every passage written before the signal: the transcript is whole.
+  const whole = busy(),
+    quiet = end({ recordings: whole.q.finish });
+  whole.recorder.write(whole.u, "Last words.");
+  quiet.signal();
+  await quiet.cleanup();
+  await Bun.sleep(0);
+  expect(quiet.written).toEqual([]);
+  expect(quiet.exits).toEqual([1]);
+});
+
+const fixtures = resolve(import.meta.dir, "fixtures"),
+  runner = join(fixtures, "run-main.ts");
+/** corgi-voice in a process of its own, with fake tools and private folders,
+ * its whisper-server never done loading. With `crash`, an error is thrown in
+ * it, outside every catch, once whisper-server has started. `stop` ends what
+ * is left of it. */
+function loading(opts: { crash?: boolean } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), "cv-main-run-")),
+    fake = fakeCorgi(),
+    log = join(dir, "whisper.log"),
+    env: Record<string, string> = {
+      PATH: `${join(fixtures, "voice")}:${dirname(process.execPath)}:/usr/bin:/bin`,
+      HOME: dir,
+      XDG_STATE_HOME: join(dir, "state"),
+      XDG_CACHE_HOME: join(dir, "cache"),
+      XDG_DATA_HOME: join(dir, "data"),
+      XDG_RUNTIME_DIR: join(dir, "run"),
+      CORGI_FAKE_WHISPER_LOG: log,
+      CORGI_FAKE_WHISPER_MODE: "no_health",
+      ...(opts.crash ? { CV_TEST_CRASH_WHEN: log } : {}),
+    };
+  // A model of the pinned size, so the start gets as far as loading it.
+  const entry = models.catalog[models.default_model],
+    model = models.fileOf(entry, env);
+  mkdirSync(dirname(model), { recursive: true });
+  mkdirSync(env.XDG_RUNTIME_DIR, { recursive: true });
+  const fd = openSync(model, "w");
+  ftruncateSync(fd, entry.bytes);
+  closeSync(fd);
+  const child = Bun.spawn([process.execPath, runner, "--corgi", fake.cmd], {
+    env,
+    stdin: "ignore",
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  /** The fake whisper-server's PID, once it has started. */
+  const whisper = (): number | null => {
+    try {
+      return (JSON.parse(readFileSync(log, "utf8").split("\n")[0]) as { pid: number }).pid;
+    } catch {
+      return null;
+    }
+  };
+  return {
+    child,
+    lock: join(env.XDG_RUNTIME_DIR, "corgi-voice.lock"),
+    whisper,
+    /** The exit status, or "still running" after 15 s. */
+    ended: () => Promise.race([child.exited, Bun.sleep(15_000).then(() => "still running" as const)]),
+    stop: () => {
+      child.kill("SIGKILL");
+      const pid = whisper();
+      try {
+        if (pid) process.kill(pid, "SIGKILL");
+      } catch {}
+      fake.cleanup();
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+const runs = (pid: number) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+test("a crash while the model loads stops whisper-server and releases the lock", async () => {
+  const run = loading({ crash: true });
+  try {
+    expect(await run.ended()).toBe(1);
+    expect(await new Response(run.child.stderr).text()).toContain("corgi-voice: Error: crashed while the model loads");
+    // It had started, and it is gone.
+    const pid = run.whisper();
+    expect(pid).not.toBeNull();
+    expect(runs(pid!)).toBe(false);
+    expect(existsSync(run.lock)).toBe(false);
+  } finally {
+    run.stop();
+  }
+}, 30_000);
+
+test("a signal while the model loads stops whisper-server and releases the lock", async () => {
+  const run = loading();
+  try {
+    const end = Date.now() + 15_000;
+    while (run.whisper() === null && Date.now() < end) await Bun.sleep(20);
+    const pid = run.whisper()!;
+    expect(pid).not.toBeNull();
+    expect([runs(pid), existsSync(run.lock)]).toEqual([true, true]);
+    run.child.kill("SIGTERM");
+    expect(await run.ended()).toBe(1);
+    expect(runs(pid)).toBe(false);
+    expect(existsSync(run.lock)).toBe(false);
+  } finally {
+    run.stop();
+  }
+}, 30_000);

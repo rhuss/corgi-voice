@@ -1,7 +1,9 @@
 //! A stand-in for the `corgi` command (FR-029). It reads the scenario JSON
 //! named by `FAKE_CORGI_SCENARIO` on every call, so a test can change what
 //! Corgi reports between polls, and appends each call as a JSON line
-//! `{argv, stdin, at, pid}` to `FAKE_CORGI_LOG`.
+//! `{argv, stdin, at, pid}` to `FAKE_CORGI_LOG`. `stdin` is whatever the call
+//! was given, read to its end for every call, so a test sees anything that
+//! crossed to Corgi besides the arguments (FR-015).
 import { appendFileSync, readFileSync } from "node:fs";
 
 /** What one call answers: output, exit code and how long it takes first. */
@@ -34,7 +36,7 @@ async function main(): Promise<number> {
     args = args.slice(2);
   }
   const sending = args[0] === "pane" && args[1] === "send" && args.includes("--stdin") && !args.includes("--help");
-  const stdin = sending ? await Bun.stdin.text() : null;
+  const stdin = await Bun.stdin.text();
   if (logFile) appendFileSync(logFile, JSON.stringify({ argv, stdin, at: Date.now(), pid: process.pid }) + "\n");
 
   let reply: Reply;

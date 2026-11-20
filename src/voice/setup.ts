@@ -50,10 +50,15 @@ async function hasVad(binary: string): Promise<boolean> {
     return false;
   }
 }
-/** Downloads `entry` to the cache through `<file>.part`, checking its size
- * and SHA-256 before it takes the file's name. */
-export async function download(entry: models.Entry, progress: (bytes: number) => void): Promise<void> {
-  const file = models.fileOf(entry),
+/** Downloads `entry` into the cache, where `env` places it, through
+ * `<file>.part`, checking its size and SHA-256 before it takes the file's
+ * name, and with it the place of a broken file of that name. */
+export async function download(
+  entry: models.Entry,
+  progress: (bytes: number) => void,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
+  const file = models.fileOf(entry, env),
     part = file + ".part";
   mkdirSync(dirname(file), { recursive: true });
   try {
@@ -96,7 +101,7 @@ export async function run(
     write?: (text: string) => void;
     entries?: { model: models.Entry; filter: models.Entry };
     path?: string;
-    /** Where the old and new files are; `process.env` by default. */
+    /** Where the old and new files are, settings and models alike; `process.env` by default. */
     env?: NodeJS.ProcessEnv;
   } = {},
 ): Promise<number> {
@@ -141,17 +146,18 @@ export async function run(
     [`model ${model}`, entries.model],
     ["speech filter", entries.filter],
   ] as const) {
-    if (models.installed(entry)) {
-      write(`[ok] ${label} ${models.fileOf(entry)}\n`);
+    if (models.installed(entry, env)) {
+      write(`[ok] ${label} ${models.fileOf(entry, env)}\n`);
       continue;
     }
     let shown = "";
     try {
-      await download(entry, bytes => {
+      const progress = (bytes: number) => {
         const line = `downloading ${label}  ${mb(bytes)} / ${mb(entry.bytes)}  ${Math.floor((bytes * 100) / entry.bytes)}%`;
         if (line !== shown) write(`\r\x1b[2K${(shown = line)}`);
-      });
-      write(`\r\x1b[2K[ok] ${label} ${models.fileOf(entry)}\n`);
+      };
+      await download(entry, progress, env);
+      write(`\r\x1b[2K[ok] ${label} ${models.fileOf(entry, env)}\n`);
     } catch (error) {
       ready = false;
       const why = errors.is(error, "ChecksumMismatch")

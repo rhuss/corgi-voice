@@ -6,7 +6,8 @@ import { tmpdir } from "node:os";
 import type { Reply, Scenario } from "./fake-corgi";
 
 export type { Reply, Scenario };
-export type Call = { argv: string[]; stdin: string | null; at: number; pid: number };
+/** One call of the fake: `stdin` is all it was given, "" for nothing. */
+export type Call = { argv: string[]; stdin: string; at: number; pid: number };
 export type FakeViewer = { id: number; pane: number | null; active: number; watched?: boolean; workspace?: number };
 export type FakePane = {
   id: number;

@@ -34,6 +34,9 @@ export type Notice = { at: number; kind: "info" | "error"; text: string };
 
 /** How many notices the history keeps. */
 const max_notices = 200;
+/** How long a stop waits for the passages still being transcribed before it
+ * closes the file without them. */
+export const stop_wait_ms = 10_000;
 
 /** The OS message of a file error, without the stack. */
 function message(error: unknown): string {
@@ -123,9 +126,9 @@ export class Recorder {
     this.notice("info", "resumed");
   }
   /** Stops the current recording at once and closes its file once its pending
-   * passages are written, or after `timeoutMs`; `late` counts those left out.
-   * Null when nothing was recording. */
-  stop(timeoutMs = 10_000): Promise<{ path: string; late: number }> | null {
+   * passages are written, or after `timeoutMs` (10 s unless given); `late`
+   * counts those left out. Null when nothing was recording. */
+  stop(timeoutMs = stop_wait_ms): Promise<{ path: string; late: number }> | null {
     const r = this.current;
     if (!r) return null;
     r.stopped_at = this.deps.now();

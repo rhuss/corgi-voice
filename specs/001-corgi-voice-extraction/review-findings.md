@@ -151,6 +151,9 @@ Test command: `bun test` (auto-detected through package.json), plus `bun run che
 
 ## Remaining Minor findings
 
+**Update 2026-11-20 (after merge):** all items below are fixed: reconnect machinery and `closed` event removed, one control-character helper, typed `why` instead of matching display strings, stale comments reworded, `Target.gone` and `Poller.delivered()` instead of reaching into the poller, one `ThemeSetting`, cleanup armed from the first acquired resource (lock, whisper-server, capture, terminal), the late-passages line on signal exits, one `delivery:` log line per delivery (never the text), `machine list` failures logged once, SHA-256 check before taking an old-cache model, and the seven test gaps (now 502 tests). NOTABLE-1 and NOTABLE-2 are fixed as well; NOTABLE-3 to NOTABLE-7 remain observations.
+
+
 - architecture: leftover reconnect machinery from Corgi's socket protocol in session.ts and link.ts (5 s retry, `closed` event, `VoiceLink.set`); dead `reason()` cases; dead modules and exports (src/util/json.ts, parts of util/text.ts and util/errors.ts); the control-character regex repeated in 8 places; display strings used as state (`unreachable` matching, "no viewer" vs "no viewer attached"); stale comments describing Corgi; CorgiLink reaching into Poller internals; `ThemeSetting` duplicated.
 - production-readiness: crash handlers only exist while the window runs (a crash during model load leaves whisper-server running); a signal exit does not print the "passages did not finish" line; the verbose log has no per-delivery line (target, exit code, stderr) and the poller swallows `machine list` failures (also architecture F10).
 - security: models taken from the old cache are checked by size only, not SHA-256.

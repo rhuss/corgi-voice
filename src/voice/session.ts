@@ -1,14 +1,15 @@
-//! Voice mode's pipeline: microphone frames become utterances, Whisper's text
-//! is cleaned and classified, and one delivery at a time goes to Corgi. The
-//! link (CorgiLink) holds each delivery to 2 s; the session's own bound is a
-//! safety net. Mute lives here alone: nothing about it goes to Corgi.
+//! corgi-voice's pipeline: microphone frames become utterances, Whisper's
+//! text is cleaned and classified, and one delivery at a time goes to Corgi.
+//! The link (CorgiLink) holds each delivery to 2 s, and its bound is the one
+//! that decides; the session's own, a little later, is only a net under a
+//! link that never settles. Mute lives here alone: nothing about it goes to
+//! Corgi.
 import * as wav from "./wav";
 import * as text from "./text";
 import * as level from "./level";
 import * as gauge from "./gauge";
 import * as whisper from "./whisper";
 import * as errors from "../util/errors";
-import { Failure } from "../util/failure";
 import { no_answer } from "../corgi/errors";
 import { bounded, type Seen, type VoiceLink } from "./link";
 import type { Segmenter, Segment } from "./segmenter";
@@ -29,7 +30,9 @@ export type Utterance = {
   timings: { transcribe_ms?: number; deliver_ms?: number };
   /** The transcript recording this passage goes to, decided when its speech ended. */
   record: Recording | null;
-  /** Why it is no longer typed; null while it may still be. */
+  /** Why it is no longer typed; null while it may still be. Until its row
+   * ends, `reason` then holds the named cause of a missing viewer (a machine
+   * or Corgi that does not answer, output not understood), when there is one. */
   untyped: Untyped | null;
   /** Sent to be typed, but no answer came in time: it may have been typed. */
   maybe_typed: boolean;
@@ -75,13 +78,18 @@ export function peakOf(pcm: Int16Array): number {
 }
 /** Why a passage is not typed. */
 export type Untyped = "muted" | "no_viewer" | "backlog";
-/** What the history says for each, after "recorded, not typed" or "discarded". */
+/** What the history says for each after "recorded, not typed", unless the
+ * passage has a named cause. */
 const untyped_reason: Record<Untyped, string> = {
   muted: "muted",
   no_viewer: "no viewer attached",
   backlog: "backlog",
 };
-/** "connected" while Corgi answers (at least one machine within 2 s); "lost" while it does not. */
+/** What a discarded row says for a missing viewer without a named cause. */
+const no_viewer = "no viewer";
+/** "connecting" until the link's first view of the target; then "connected"
+ * while Corgi answers and "lost" while Corgi, or the machine a viewer shows,
+ * does not; "closed" after close(). */
 export type LinkState = "connecting" | "connected" | "lost" | "closed";
 export type Unavailable = MicProblem | "server_down";
 
@@ -109,13 +117,11 @@ const max_backlog = 4;
  * that a passage is left out, and the recording says so, rather than memory
  * growing for as long as Whisper stays behind. */
 export const max_queued = 30;
-/** The session's own bound around a delivery: a safety net over CorgiLink's 2 s. */
+/** The session's own bound around a delivery. It decides nothing while the
+ * link works: CorgiLink rejects a delivery at `deadline_ms` (2 s) and kills
+ * its process. This one, later, only ends the wait for a link that never
+ * settles, so one stuck call cannot hold the deliveries after it for good. */
 export const safety_ms = 2500;
-/** Whether a reason says Corgi (or the machine a viewer shows) does not
- * answer, rather than that no viewer is attached. */
-function unreachable(reason: string | null): boolean {
-  return !!reason && /\bunreachable\b/.test(reason);
-}
 
 export class VoiceSession {
   history: Utterance[] = [];
@@ -129,37 +135,34 @@ export class VoiceSession {
   /** How far into the silence window the utterance in progress is, 0 to 1. */
   pause = 0;
   /** Whether a viewer would take text (without one, voice holds off), the
-   * label of the pane text would go to, its machine, and why there is none. */
+   * label of the pane text would go to, its machine, and why there is none:
+   * `reason` in words, `why` for the code to tell the cases apart. */
   viewer = true;
   focus: string | null = null;
   machine: string | null = null;
   reason: string | null = null;
+  why: Seen["why"] = null;
   /** A gauge listening to the background: what it heard, the loudest level
    * so far, and how far it is, 0 to 1. */
   gauge: { frames: Int16Array[]; loudest: number; progress: number } | null = null;
   /** Gauges that finished or failed; a cancelled one leaves none. */
   gauges: GaugeRow[] = [];
   private gauge_started = 0;
-  private link: VoiceLink | null = null;
   private next_id = 1;
   /** Passages handed to Whisper and not yet done with it, each holding its audio. */
   private queued = 0;
   private current: Utterance | null = null;
   private transcriptions: Promise<void> = Promise.resolve();
   private deliveries: Promise<void> = Promise.resolve();
-  private retry?: ReturnType<typeof setTimeout>;
-  /** Retries every 5 s log a failure once, until it changes or the link is back. */
-  private link_failure = new Failure();
   private listeners: (() => void)[] = [];
   constructor(
     private deps: {
-      link: () => Promise<VoiceLink>;
+      link: VoiceLink;
       transcriber: Transcriber;
       segmenter: Segmenter;
       now: () => number;
       /** The session's safety bound around a delivery; 2.5 s by default. */
       deliverTimeoutMs?: number;
-      retryMs?: number;
       log?: (line: string) => void;
       /** Takes the passages of a transcript recording. */
       recorder?: Recorder;
@@ -187,60 +190,25 @@ export class VoiceSession {
   private changed(): void {
     for (const fn of this.listeners) fn();
   }
-  /** Starts the link to Corgi, or throws what went wrong. A failure
-   * schedules a retry, so a caller that gives up must close(). */
-  async connect(): Promise<void> {
-    if (this.link_state === "closed") return;
-    this.link_state = "connecting";
-    this.changed();
-    let link: VoiceLink | null = null;
-    try {
-      link = await this.deps.link();
-      if (this.isClosed()) return link.close();
-      const attached = link;
-      attached.on("viewer", state => {
-        if (this.link === attached) this.applyViewer(state);
-      });
-      attached.on("closed", why => this.lost(attached, why));
-      const reply = await attached.watch();
-      if (this.isClosed()) return attached.close();
-      this.link = attached;
-      this.link_state = "connected";
-      this.link_failure.clear();
-      this.deps.log?.("link: connected");
-      this.applyViewer(reply);
-      this.changed();
-    } catch (error) {
-      link?.close();
-      if (this.isClosed()) return;
-      this.link_state = "lost";
-      this.schedule();
-      if (this.link_failure.changed(error)) this.deps.log?.(`link: ${errors.name(error) ?? error}`);
-      this.changed();
-      throw error;
-    }
+  /** Starts the link, once: every view of the target it reports is taken
+   * from here on, and the first ends "connecting". The link keeps asking
+   * Corgi by itself, so nothing is retried here: should `watch()` ever
+   * reject, this rejects with the same, for the caller to report. */
+  async start(): Promise<void> {
+    if (this.isClosed()) return;
+    const link = this.deps.link;
+    link.on("viewer", seen => this.applyViewer(seen));
+    this.applyViewer(await link.watch());
   }
   /** Checked again after each wait: quitting can happen meanwhile. */
   private isClosed(): boolean {
     return this.link_state === "closed";
   }
-  private lost(link: VoiceLink, why: string): void {
-    if (this.link !== link || this.link_state === "closed") return;
-    this.link = null;
-    this.link_state = "lost";
-    this.deps.log?.(`link: lost (${why})`);
-    this.changed();
-    this.schedule();
-  }
-  private schedule(): void {
-    clearTimeout(this.retry);
-    this.retry = setTimeout(() => void this.connect().catch(() => {}), this.deps.retryMs ?? 5000);
-  }
   frame(f: Int16Array): void {
     this.level = level.rmsToPercent(level.rms(f));
     // Frames again after a microphone failure: it is back.
     if (this.mic) this.setAvailable(true, null);
-    // A gauge needs only the microphone: mute, the viewer, the link and the server don't stop it.
+    // A gauge needs only the microphone: mute, the viewer, Corgi and the server don't stop it.
     if (this.gauge) return this.listen(f);
     // A running recording keeps listening while muted or without a viewer.
     if (!this.available || (!this.recordingRuns && (this.muted || !this.viewer))) {
@@ -248,7 +216,7 @@ export class VoiceSession {
       if (this.current) {
         this.deps.segmenter.abort();
         this.current.status = this.muted ? "muted" : "discarded";
-        this.current.reason = this.muted ? null : "no viewer";
+        this.current.reason = this.muted ? null : no_viewer;
         this.letGo();
         this.changed();
       }
@@ -362,12 +330,12 @@ export class VoiceSession {
     // Neither typed nor written: Whisper is not asked for text nothing would use.
     if (!u.record && u.untyped) return this.finish(u, ...this.untypedEnd(u, u.untyped));
     if (!u.record && (this.muted || !this.viewer))
-      return this.finish(u, this.muted ? "muted" : "discarded", this.muted ? null : "no viewer");
-    // A recorded passage is written whether or not it can be typed; the link
-    // is checked when it is typed, as for any passage.
+      return this.finish(u, this.muted ? "muted" : "discarded", this.muted ? null : no_viewer);
+    // A recorded passage is written whether or not it can be typed; whether
+    // Corgi answers is checked when it is typed, as for any passage.
     const why: Untyped | null = this.muted ? "muted" : !this.viewer ? "no_viewer" : null;
     if (u.record && why) this.untype(u, why);
-    // Speech this far behind Whisper or the runtime is not kept on top; a
+    // Speech this far behind Whisper or Corgi is not kept on top; a
     // recorded passage is still written, only not typed.
     if (this.pending >= max_backlog) {
       if (!u.record) return this.finish(u, "failed", "backlog");
@@ -385,18 +353,35 @@ export class VoiceSession {
     u.status = "transcribing";
     this.changed();
     this.queued++;
-    this.transcriptions = this.transcriptions.then(() => this.transcribe(u, segment));
+    this.transcriptions = this.transcriptions
+      .then(() => this.transcribe(u, segment))
+      .catch(error => this.unexpected(u, error));
   }
-  /** `u` is no longer typed, for `why`; the first reason stays. */
+  /** Something threw in `u`'s transcription or delivery that should not
+   * have: `u` ends as failed, the log says what, and the chain it ran in
+   * goes on, so the utterances after it are not held up for good. */
+  private unexpected(u: Utterance, error: unknown): void {
+    try {
+      const what = error instanceof Error ? (error.stack ?? error.message) : String(error);
+      this.deps.log?.(`utterance ${u.id}: unexpected error: ${what}`);
+      if (u.status === "recording" || u.status === "transcribing" || u.status === "delivering")
+        this.finish(u, "failed", reason(error));
+    } catch {
+      // Whatever fails here too must not break the chain.
+    }
+  }
+  /** `u` is no longer typed, for `why`; the first reason stays. A missing
+   * viewer's named cause is kept with it, as it is now. */
   private untype(u: Utterance, why: Untyped): void {
     if (u.untyped) return;
     u.untyped = why;
-    u.reason = why === "no_viewer" ? this.noViewer() : untyped_reason[why];
+    u.reason = why === "no_viewer" ? this.named() : null;
   }
-  /** Why nothing can be typed without a target: Corgi or a machine that does
-   * not answer, named, else that no viewer is attached. */
-  private noViewer(): string {
-    return this.reason && this.reason !== untyped_reason.no_viewer ? this.reason : untyped_reason.no_viewer;
+  /** The named cause of a missing viewer: Corgi or a machine that does not
+   * answer, or output not understood. Null when no viewer is attached and
+   * nothing more is known. */
+  private named(): string | null {
+    return this.why !== null && this.why !== "no_viewer" ? this.reason : null;
   }
   /** A recording is running, or holds the passage being spoken since it
    * paused or stopped, so speech is heard even when it cannot be typed. */
@@ -412,7 +397,7 @@ export class VoiceSession {
       u.record = null;
     }
   }
-  /** Utterances waiting for Whisper or for the runtime, each holding its audio or text. */
+  /** Utterances waiting for Whisper or for Corgi, each holding its audio or text. */
   private get pending(): number {
     let n = 0;
     for (const u of this.history) if (u.status === "transcribing" || u.status === "delivering") n++;
@@ -449,19 +434,19 @@ export class VoiceSession {
     u.text = cleaned;
     if (u.record && !this.deps.recorder?.write(u, cleaned)) u.record = null;
     this.changed();
-    this.deliveries = this.deliveries.then(() => this.deliver(u));
+    this.deliveries = this.deliveries.then(() => this.deliver(u)).catch(error => this.unexpected(u, error));
   }
   private async deliver(u: Utterance): Promise<void> {
     if (u.status !== "transcribing") return;
     if (u.untyped) return this.finish(u, ...this.untypedEnd(u, u.untyped));
-    const link = this.link;
-    if (!link || this.link_state !== "connected")
+    // Before the link's first view, or after close().
+    if (this.link_state !== "connected")
       return this.finish(u, u.record ? "recorded" : "failed", this.reason ?? "not connected");
     u.status = "delivering";
     this.changed();
     const started = this.deps.now();
     try {
-      await bounded(link.type(u.text!), this.deps.deliverTimeoutMs ?? safety_ms);
+      await bounded(this.deps.link.type(u.text!), this.deps.deliverTimeoutMs ?? safety_ms);
       u.timings.deliver_ms = this.deps.now() - started;
       this.finish(u, "delivered", null);
     } catch (error) {
@@ -475,13 +460,14 @@ export class VoiceSession {
       else this.finish(u, "failed", reason(error));
     }
   }
-  /** How a passage that is not typed ends: recorded when it was written. The
-   * reason is the one it was untyped for, not the one now. */
+  /** How a passage that is not typed ends, and what its row says: recorded
+   * when it was written, else muted or discarded. A named cause is the one
+   * it was untyped for, not the one now. */
   private untypedEnd(u: Utterance, why: Untyped): [UtteranceStatus, string | null] {
-    const because = u.reason ?? untyped_reason[why];
-    if (u.record) return ["recorded", because];
+    const named = u.reason;
+    if (u.record) return ["recorded", named ?? untyped_reason[why]];
     if (why === "muted") return ["muted", null];
-    return ["discarded", because === untyped_reason.no_viewer ? "no viewer" : because];
+    return ["discarded", named ?? (why === "no_viewer" ? no_viewer : untyped_reason[why])];
   }
   private finish(u: Utterance, status: UtteranceStatus, why: string | null): void {
     u.status = status;
@@ -515,25 +501,28 @@ export class VoiceSession {
   /** A viewer attached or went away, the target moved, or Corgi stopped or
    * started answering; what is said without a viewer has nowhere to go. */
   private applyViewer(state: Seen): void {
-    const link_state: LinkState = unreachable(state.reason) ? "lost" : "connected";
+    // Quitting can come before the link's first view, or between two.
+    if (this.isClosed()) return;
+    const link_state: LinkState = state.why === "unreachable" ? "lost" : "connected";
     if (
       this.viewer === state.viewer &&
       this.focus === state.focus &&
       this.machine === state.machine &&
       this.reason === state.reason &&
+      this.why === state.why &&
       this.link_state === link_state
     )
       return;
+    if (this.link_state !== link_state)
+      this.deps.log?.(link_state === "lost" ? `link: lost (${state.reason})` : "link: connected");
     // The reason first: what is dropped now names it (a machine that stopped answering, say).
     this.reason = state.reason;
-    if (this.viewer && !state.viewer) {
-      const why = this.noViewer();
-      this.discard("discarded", why === untyped_reason.no_viewer ? "no viewer" : why, "no_viewer");
-    }
+    this.why = state.why;
+    if (this.viewer && !state.viewer) this.discard("discarded", this.named() ?? no_viewer, "no_viewer");
     this.viewer = state.viewer;
     this.focus = state.focus;
     this.machine = state.machine;
-    if (this.link_state !== "closed") this.link_state = link_state;
+    this.link_state = link_state;
     this.changed();
   }
   /** Speech is being recorded. */
@@ -600,8 +589,6 @@ export class VoiceSession {
   close(): void {
     this.link_state = "closed";
     this.gauge = null;
-    clearTimeout(this.retry);
-    this.link?.close();
-    this.link = null;
+    this.deps.link.close();
   }
 }

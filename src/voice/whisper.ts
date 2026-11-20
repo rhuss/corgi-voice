@@ -1,4 +1,4 @@
-//! The whisper-server voice mode starts, owns and stops. It is never
+//! The whisper-server corgi-voice starts, owns and stops. It is never
 //! adopted when something else holds the port.
 
 import * as subprocess from "../util/subprocess";
