@@ -2,3 +2,5 @@ node_modules/
 dist/
 .mcp.json
 *.bun-build
+.DS_Store
+*.log
