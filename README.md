@@ -25,10 +25,14 @@ From a clone of this repository:
 
 ```bash
 bun install
-bun link        # puts corgi-voice on PATH
+bun link        # creates ~/.bun/bin/corgi-voice
 ```
 
-`bun install -g` from the repository works as well.
+`bun install -g` from the repository works as well. Both put the command in `~/.bun/bin`, which the Bun installer adds to `PATH`. If `which corgi-voice` finds nothing, add `~/.bun/bin` to `PATH` or link the command into a directory that is already on it:
+
+```bash
+ln -s ~/.bun/bin/corgi-voice ~/.local/bin/corgi-voice
+```
 
 ## Setup
 

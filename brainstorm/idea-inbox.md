@@ -64,3 +64,30 @@ Ideas captured from code reviews for future brainstorming.
 - **Summary**: Each path-based reaper design (rename aside, reaper turn) leaves a narrow multi-process race.
 
 > Track alongside os-level-instance-lock; any path protocol needs an OS primitive to be airtight.
+
+### recording-stop-waits-on-noise
+
+- **Source**: walkthrough
+- **Date**: 2026-11-20
+- **Reference**: 001-corgi-voice-extraction (RUNBOOK step 8)
+- **Summary**: Stopping a recording waited the full 10 s (`waited_ms=10001 late=0`) because background noise above the recording threshold kept the segmenter in speech; speech still going at stop does not belong to the recording (005 FR-004a), so stop should not wait for it.
+
+> Bug. Reproduce with noise above threshold 20 at the moment `R` is pressed.
+
+### prompt-folder-tab-completion
+
+- **Source**: walkthrough (user request)
+- **Date**: 2026-11-20
+- **Reference**: 001-corgi-voice-extraction FR-021
+- **Summary**: The recording file prompt lost Corgi's folder browser; the user wants Tab completion of folder names in the name field instead of a browser.
+
+> Small feature in src/ui/prompt.ts.
+
+### setup-checks-corgi-reaches-runtime
+
+- **Source**: walkthrough
+- **Date**: 2026-11-20
+- **Reference**: 001-corgi-voice-extraction FR-003, FR-004 (RUNBOOK steps 3 and 5)
+- **Summary**: `--setup` reported `[ok] corgi` for an old release that could not talk to the running Corgi (`JSON Parse error: Unexpected identifier "HTTP"`); setup should try `list --json` and warn, and the window's error should hint that the `corgi` command may not match the running Corgi (set `corgi` in voice.json).
+
+> Two small changes: a reachability check in setup, a hint for protocol-looking errors.
