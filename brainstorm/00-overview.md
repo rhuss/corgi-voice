@@ -9,7 +9,7 @@ Earlier voice brainstorms (dictation, transcript recording, glossary, speaker se
 | # | Date | Topic | Status | Spec | Issue |
 |---|------|-------|--------|------|-------|
 | 01 | 2026-11-20 | walkthrough-fixes | done | `002-walkthrough-fixes` | - |
-| 02 | 2026-11-20 | control-channel | active | - | - |
+| 02 | 2026-11-20 | control-channel | done (phase 1) | `003-control-channel` | - |
 
 ## Open Threads
 - Whether Tab in the recording prompt also completes existing transcript files, or folders only (from #01)
