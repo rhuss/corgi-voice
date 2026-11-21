@@ -368,6 +368,31 @@ test("corgi-voice hears when a recording begins and ends, by a stop or a write f
   expect(active).toEqual([true, false, true, false]);
 });
 
+test("change listeners hear each start, pause, resume, stop and close, a write failure's close included", async () => {
+  const { recorder } = setup(),
+    dir = folder(),
+    seen: (string | null)[] = [];
+  recorder.on("change", () => seen.push(recorder.current?.state ?? null));
+  recorder.start(join(dir, "a.txt"));
+  recorder.pause();
+  recorder.resume();
+  // Nothing pending: the stop closes at once, after the stop itself.
+  await recorder.stop();
+  expect(seen).toEqual(["running", "paused", "running", null, null]);
+  seen.length = 0;
+  recorder.start(join(dir, "b.txt"));
+  const u = passage(0, 1000);
+  recorder.claim(u);
+  recorder.current!.file.close();
+  recorder.write(u, "Lost words.");
+  expect(seen).toEqual(["running", null]);
+  // A pause or resume that changes nothing says nothing.
+  seen.length = 0;
+  recorder.pause();
+  recorder.resume();
+  expect(seen).toEqual([]);
+});
+
 test("a close that fails is reported, and the stop still settles", async () => {
   const { recorder, lines } = setup(),
     path = join(folder(), "t.txt");

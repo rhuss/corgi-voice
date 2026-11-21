@@ -81,6 +81,7 @@ Flags:
 | `--corgi CMD` | the `corgi` command: a name on `PATH` or a path to an executable |
 | `--setup` | check tools and download models |
 | `--help` | list the flags |
+| `--mute`, `--unmute`, `--toggle-mute`, `--status`, `--watch` | control the running corgi-voice; see [Mute from anywhere](#mute-from-anywhere) |
 
 ### Finding corgi
 
@@ -162,6 +163,106 @@ Each passage is synced to disk as it is written.
 Starting a recording mutes dictation; stopping it puts the mute back as it was.
 When corgi-voice ends while passages are still being transcribed, by a second quit press or by a signal, the transcript is closed without them and the terminal says how many were left out.
 
+## Mute from anywhere
+
+The running corgi-voice listens on a local control socket, so other programs can mute it and read what it is doing without switching to its window.
+
+```bash
+corgi-voice --toggle-mute     # mute, or unmute when muted
+corgi-voice --mute
+corgi-voice --unmute
+corgi-voice --status          # one short line
+corgi-voice --status --json   # the full state
+corgi-voice --watch           # a line now, then one per change, until corgi-voice quits
+corgi-voice --watch --json
+```
+
+These commands need no terminal and start no voice window.
+A mute from outside follows the same rules as `m`: unmuting is refused while voice cannot listen, and a recording still puts the mute back as it was when it stops.
+The window shows a history row `muted from outside` or `unmuted from outside`.
+
+Each command prints the state as one short line:
+
+| Line | When |
+|---|---|
+| `listening · bat · corgi-voice` | the mode, then the target the window shows |
+| `muted · marovo → api · logs` | muted, with a target on a remote machine |
+| `listening · no viewer attached` | no target: the head of the reason, as the window's Target cell (`Corgi unreachable`, `marovo unreachable`) |
+| `muted · cannot listen: microphone missing` | voice cannot listen (`microphone missing`, `microphone access denied`, `microphone busy`, `transcription server down`) |
+| `listening · bat · corgi-voice · REC` | a recording runs (`· REC paused` while paused) |
+
+With `--json` it prints the state as one JSON object:
+
+```json
+{"pid":4242,"muted":false,"mode":"listening","unavailable":null,"reason":null,"recording":"none","target":{"machine":"local","label":"bat · corgi-voice"},"updated_at":1795270000000}
+```
+
+| Field | Meaning |
+|---|---|
+| `pid` | the voice window's process |
+| `muted` | the mute setting, which decides the mode whenever voice can listen |
+| `mode` | what the window shows: `listening`, or `muted` (also while voice cannot listen) |
+| `unavailable` | why voice cannot listen: `mic_missing`, `mic_denied`, `mic_busy`, `server_down`, or `null` |
+| `reason` | why there is no target, in the window's words, or `null` |
+| `recording` | `none`, `running` or `paused` |
+| `target` | `{machine, label}`, the label being the window's Target text, or `null` |
+| `updated_at` | when another field last changed, in ms since the epoch |
+
+Exit codes:
+
+| Code | Meaning |
+|---|---|
+| `0` | done |
+| `1` | refused, such as unmuting while voice cannot listen; the reason goes to standard error, the state to standard output |
+| `2` | usage error: two control flags, a control flag with a voice-window flag, or `--json` without `--status` or `--watch` |
+| `3` | corgi-voice is not running, or did not answer within 1 second |
+
+### A global hotkey
+
+Corgi cannot bind a key to a command, so a global hotkey tool runs `corgi-voice --toggle-mute` instead.
+Hotkey tools do not read your shell's `PATH`, so give them absolute paths.
+Find corgi-voice's with:
+
+```bash
+command -v corgi-voice
+```
+
+The command starts with `#!/usr/bin/env bun`, so `bun`'s folder must be on the tool's `PATH` too.
+Find it with:
+
+```bash
+dirname "$(command -v bun)"
+```
+
+The recipes below use `/Users/me/.bun/bin` for both, as the Bun installer and `bun link` set them up; with Homebrew's Bun the `bun` folder is `/opt/homebrew/bin` instead. Put your own paths in their place.
+
+macOS Shortcuts: a new shortcut with one Run Shell Script action containing
+
+```bash
+PATH="/Users/me/.bun/bin:$PATH" /Users/me/.bun/bin/corgi-voice --toggle-mute
+```
+
+then, in the shortcut's details, Add Keyboard Shortcut.
+
+[skhd](https://github.com/koekeishiya/skhd), in `~/.config/skhd/skhdrc`:
+
+```text
+ctrl + alt - m : PATH="/Users/me/.bun/bin:$PATH" /Users/me/.bun/bin/corgi-voice --toggle-mute
+```
+
+[Hammerspoon](https://www.hammerspoon.org), in `~/.hammerspoon/init.lua`, with the new state as an alert:
+
+```lua
+hs.hotkey.bind({ "ctrl", "alt" }, "m", function()
+  local out, ok = hs.execute('PATH="/Users/me/.bun/bin:$PATH" /Users/me/.bun/bin/corgi-voice --toggle-mute')
+  hs.alert.show(ok and out or "corgi-voice did not mute: is it running?")
+end)
+```
+
+The exit code tells a script what happened: `0` the line it printed is the new state, `1` refused (voice cannot listen, so it stays muted), `3` no corgi-voice is running.
+
+For a status bar (sketchybar, tmux), run `corgi-voice --watch` once and redraw on each line, or call `corgi-voice --status` on a timer.
+
 ## Troubleshooting
 
 ### Corgi unreachable
@@ -214,6 +315,7 @@ An invalid value falls back to its default with a notice naming the field.
 | `$XDG_CACHE_HOME/corgi-voice/` (else `~/.cache/corgi-voice/`) | Whisper models and the speech filter |
 | `$XDG_DATA_HOME/corgi/transcripts/` (else `~/.local/share/corgi/transcripts/`) | default transcript folder, the same as `corgi voice` used |
 | `$XDG_RUNTIME_DIR/corgi-voice.lock` (else `lock` in the state folder) | single-instance lock |
+| `$XDG_RUNTIME_DIR/corgi-voice.sock` (else `control.sock` in the state folder) | control socket of the running corgi-voice, yours alone (mode 0600); where that path is too long for a socket, `$TMPDIR/corgi-voice-<uid>/control.sock`, which `--verbose` logs |
 | `$XDG_STATE_HOME/corgi-voice/voice.log` | log with `--verbose` |
 
 With `--verbose`, each utterance's line in `voice.log` also shows its cut: `post_roll=` used (`capped` for an utterance cut at the cap, which keeps everything), how much audio after the last loud stretch was `kept=` and `dropped=`, the speech filter's padding `pad=`, and `speech_end=`, where Whisper's last segment ends.
@@ -229,7 +331,7 @@ Read only, for taking over from `corgi voice`: `$XDG_STATE_HOME/corgi/voice.json
 
 ## Differences from `corgi voice`
 
-- No voice indicator in Corgi's sidebar, and no mute shortcut inside Corgi: the voice window is the only place showing voice state, and `m` there is the mute.
+- No voice indicator in Corgi's sidebar, and no mute shortcut inside Corgi: the voice window shows the state, and `m` there is the mute; from anywhere else, `corgi-voice --toggle-mute` on a global hotkey and `corgi-voice --status` (see [Mute from anywhere](#mute-from-anywhere)).
 - No `--ssh`: remote machines come through Corgi's own remote machines.
 - Settings and models live in corgi-voice's own folders (taken over on first start).
 - The recording prompt is one path field with a folder pop-down on Tab, not Corgi's folder browser; it does not list existing transcripts.
@@ -245,6 +347,7 @@ Two corgi-voice instances are prevented: the second refuses to start.
 ```bash
 bun test          # no microphone, Whisper or Corgi needed: a fake corgi stands in
 bun run check     # tsc --noEmit
+bun run bench:toggle   # by hand: --toggle-mute from spawn to exit, p95 under 200 ms
 ```
 
 The code that runs `corgi` lives in `src/corgi/`; the commands it may use are listed in `specs/001-corgi-voice-extraction/contracts/corgi-cli.md`.

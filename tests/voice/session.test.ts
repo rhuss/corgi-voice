@@ -1640,3 +1640,19 @@ test("the session keeps the machine whose error forms the reason, and a change o
   link.events.emitViewer(seen(true, "dictation"));
   expect(s.source).toBeNull();
 });
+
+test("note adds a row of the session's own, bounded like the recorder's notices, and tells listeners", () => {
+  let now = 1000;
+  const { s } = session([], { now: () => now }),
+    changes: number[] = [];
+  s.on("change", () => changes.push(s.events.length));
+  s.note("muted from outside");
+  expect(s.events).toEqual([{ at: 1000, text: "muted from outside" }]);
+  expect(changes).toEqual([1]);
+  for (let i = 0; i < 250; i++) {
+    now++;
+    s.note(`row ${i}`);
+  }
+  expect(s.events).toHaveLength(200);
+  expect(s.events.at(-1)?.text).toBe("row 249");
+});

@@ -145,3 +145,30 @@ Ideas captured from code reviews for future brainstorming.
 - **Summary**: No single test drives a mismatch reply from the fake corgi through poller, link, session and window to the hinted status line.
 
 > Each layer is tested on its own; one end-to-end test would pin the walkthrough scenario.
+
+### slim-control-entry
+
+- **Source**: deep-review
+- **Date**: 2026-11-21
+- **Reference**: 003-control-channel
+- **Summary**: A control command (`--toggle-mute`, `--status`) loads every window module before it reaches the control branch in main.ts.
+
+> Import cost is the largest controllable part of FR-009's 200 ms spawn-to-exit budget and grows with each window feature; lazy imports or a slim control entry would keep it flat.
+
+### control-current-is-broadcast
+
+- **Source**: deep-review
+- **Date**: 2026-11-21
+- **Reference**: 003-control-channel
+- **Summary**: `current()` in the control server reads like a getter but is the broadcast to watchers; toggle calls it twice.
+
+> A later harmless-looking call would emit watcher lines from unexpected places; a name like `refresh()` would say what it does.
+
+### tmp-fallback-squatting
+
+- **Source**: deep-review
+- **Date**: 2026-11-21
+- **Reference**: 003-control-channel
+- **Summary**: On a shared /tmp another user can create `corgi-voice-<uid>` first; the checks refuse it, which denies the control channel.
+
+> Fails closed and is safe; a README note or a less predictable name derived the same way by server and client would help.

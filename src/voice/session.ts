@@ -110,6 +110,10 @@ export function reason(error: unknown): string {
       return errors.name(error) ?? String(error);
   }
 }
+/** A history row of the session's own: `muted from outside`, say. */
+export type SessionEvent = { at: number; text: string };
+/** How many of them the history keeps, as many as the recorder's notices. */
+const max_events = 200;
 /** How many utterances may wait for Whisper or Corgi; past that, speech fails instead of piling up. */
 const max_backlog = 4;
 /** How many passages, each holding its audio, may wait for Whisper in all,
@@ -149,6 +153,8 @@ export class VoiceSession {
   gauge: { frames: Int16Array[]; loudest: number; progress: number } | null = null;
   /** Gauges that finished or failed; a cancelled one leaves none. */
   gauges: GaugeRow[] = [];
+  /** History rows of the session's own, such as a mute from outside. */
+  events: SessionEvent[] = [];
   private gauge_started = 0;
   private next_id = 1;
   /** Passages handed to Whisper and not yet done with it, each holding its audio. */
@@ -576,6 +582,12 @@ export class VoiceSession {
         u.status = status;
         u.reason = why;
       }
+  }
+  /** Adds a row of the session's own to the history. */
+  note(text: string): void {
+    this.events.push({ at: this.deps.now(), text });
+    if (this.events.length > max_events) this.events.splice(0, this.events.length - max_events);
+    this.changed();
   }
   /** The microphone stopped (`available` false, and why) or came back. */
   setAvailable(available: boolean, why: MicProblem | null): void {

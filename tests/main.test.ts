@@ -1,5 +1,5 @@
 import { test, expect, afterEach } from "bun:test";
-import { closeSync, existsSync, ftruncateSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync } from "node:fs";
+import { closeSync, existsSync, ftruncateSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import {
@@ -19,6 +19,10 @@ import * as models from "../src/voice/models";
 import { fakeCorgi } from "./fixtures/corgi";
 import * as paths from "../src/util/paths";
 import { acquire, type Lock } from "../src/util/lock";
+import { startServer } from "../src/control/server";
+import { request } from "../src/control/client";
+import type { LinkState, Unavailable } from "../src/voice/session";
+import type { RecordingState } from "../src/voice/recorder";
 import { Recorder } from "../src/voice/recorder";
 import type { Tuning } from "../src/voice/tuning";
 import type { Utterance } from "../src/voice/session";
@@ -372,10 +376,11 @@ function end(held: Held) {
   };
 }
 
-test("the cleanup gives back what is held, once: terminal, recordings, microphone, link, server, lock", async () => {
+test("the cleanup gives back what is held, once: terminal, control channel, recordings, microphone, link, server, lock", async () => {
   const order: string[] = [],
     held: Held = {
       lock: () => void order.push("lock"),
+      control: () => void order.push("control"),
       link: () => void order.push("link"),
       server: async () => {
         order.push("server stopping");
@@ -389,12 +394,21 @@ test("the cleanup gives back what is held, once: terminal, recordings, microphon
     e = end(held);
   const first = e.cleanup();
   // What needs no waiting is done before the call returns: the terminal above all.
-  expect(order).toEqual(["terminal", "recordings", "capture", "link", "server stopping"]);
+  expect(order).toEqual(["terminal", "control", "recordings", "capture", "link", "server stopping"]);
   expect(held.ended).toBe(true);
   // A second call, while it runs or after, starts nothing again.
   await Promise.all([first, e.cleanup()]);
   await e.cleanup();
-  expect(order).toEqual(["terminal", "recordings", "capture", "link", "server stopping", "server stopped", "lock"]);
+  expect(order).toEqual([
+    "terminal",
+    "control",
+    "recordings",
+    "capture",
+    "link",
+    "server stopping",
+    "server stopped",
+    "lock",
+  ]);
   expect(e.logged).toEqual(["corgi-voice stopped"]);
   expect(e.exits).toEqual([]);
 });
@@ -416,6 +430,22 @@ test("the cleanup takes what is held when it runs, and a step that fails does no
   };
   await e.cleanup();
   expect(order).toEqual(["server", "lock"]);
+});
+
+test("an exit that came some other way removes the socket and the lock at once", () => {
+  const order: string[] = [],
+    e = end({
+      terminal: () => void order.push("terminal"),
+      control: () => void order.push("control"),
+      server: async () => void order.push("server"),
+      lock: () => void order.push("lock"),
+    });
+  e.exiting();
+  // The cleanup's synchronous steps, then the socket and the lock again, without waiting.
+  expect(order.slice(0, 2)).toEqual(["terminal", "terminal"]);
+  expect(order.filter(o => o === "control").length).toBeGreaterThanOrEqual(1);
+  expect(order.at(-1)).toBe("lock");
+  expect(order.indexOf("control")).toBeLessThan(order.indexOf("lock"));
 });
 
 test("a signal runs the cleanup, then exits with status 1", async () => {
@@ -555,6 +585,7 @@ function loading(opts: { crash?: boolean } = {}) {
   return {
     child,
     lock: join(env.XDG_RUNTIME_DIR, "corgi-voice.lock"),
+    socket: join(env.XDG_RUNTIME_DIR, "corgi-voice.sock"),
     whisper,
     /** The exit status, or "still running" after 15 s. */
     ended: () => Promise.race([child.exited, Bun.sleep(15_000).then(() => "still running" as const)]),
@@ -588,6 +619,7 @@ test("a crash while the model loads stops whisper-server and releases the lock",
     expect(pid).not.toBeNull();
     expect(runs(pid!)).toBe(false);
     expect(existsSync(run.lock)).toBe(false);
+    expect(existsSync(run.socket)).toBe(false);
   } finally {
     run.stop();
   }
@@ -600,12 +632,270 @@ test("a signal while the model loads stops whisper-server and releases the lock"
     while (run.whisper() === null && Date.now() < end) await Bun.sleep(20);
     const pid = run.whisper()!;
     expect(pid).not.toBeNull();
-    expect([runs(pid), existsSync(run.lock)]).toEqual([true, true]);
+    expect([runs(pid), existsSync(run.lock), existsSync(run.socket)]).toEqual([true, true, true]);
+    // It answers while the model loads.
+    const answer = await request(run.socket, "status");
+    expect(answer).toMatchObject({ ok: true, answer: { ok: true, state: { pid: run.child.pid } } });
     run.child.kill("SIGTERM");
     expect(await run.ended()).toBe(1);
     expect(runs(pid)).toBe(false);
     expect(existsSync(run.lock)).toBe(false);
+    expect(existsSync(run.socket)).toBe(false);
   } finally {
     run.stop();
   }
 }, 30_000);
+
+/** The session a test control server stands in for: listening on `bat · corgi-voice`. */
+function stubSession() {
+  const listeners: (() => void)[] = [];
+  const session = {
+    muted: false,
+    unavailable: null as Unavailable | null,
+    viewer: true,
+    focus: "bat · corgi-voice" as string | null,
+    machine: "local" as string | null,
+    reason: null as string | null,
+    link_state: "connected" as LinkState,
+    events: [] as string[],
+    get available() {
+      return session.unavailable === null;
+    },
+    setMuted(muted: boolean, restore = false) {
+      if (!muted && !session.available && !restore) return;
+      if (session.muted === muted) return;
+      session.muted = muted;
+      session.changed();
+    },
+    note(text: string) {
+      session.events.push(text);
+      session.changed();
+    },
+    on: (_event: "change", fn: () => void) => void listeners.push(fn),
+    changed: () => listeners.forEach(fn => fn()),
+  };
+  return session;
+}
+function stubRecorder() {
+  const listeners: (() => void)[] = [];
+  const recorder = {
+    current: null as { state: RecordingState } | null,
+    on: (_event: "change", fn: () => void) => void listeners.push(fn),
+    set(state: RecordingState | null) {
+      recorder.current = state && { state };
+      listeners.forEach(fn => fn());
+    },
+  };
+  return recorder;
+}
+/** Runs `main` with control flags and no terminal, in private XDG folders,
+ * after `prepare` (which may start a test server at `socket`). */
+async function command(
+  args: string[],
+  prepare: (env: { socket: string; dir: string }) => unknown = () => {},
+  during: (env: { socket: string; dir: string; printed: () => string }) => Promise<void> = async () => {},
+  after: () => unknown = () => null,
+) {
+  const dir = mkdtempSync(join(tmpdir(), "cv-cm-")),
+    // Short names keep the socket path well under the limit.
+    keys = { XDG_STATE_HOME: "s", XDG_CACHE_HOME: "c", XDG_DATA_HOME: "d", XDG_RUNTIME_DIR: "r", TMPDIR: "t" },
+    saved = Object.keys(keys).map(k => [k, process.env[k]] as const);
+  for (const [k, name] of Object.entries(keys)) process.env[k] = join(dir, name);
+  const out: string[] = [],
+    err: string[] = [],
+    write = process.stdout.write,
+    ewrite = process.stderr.write;
+  const servers: { close(): void }[] = [];
+  try {
+    mkdirSync(process.env.XDG_RUNTIME_DIR!, { recursive: true });
+    mkdirSync(process.env.TMPDIR!, { recursive: true });
+    // Never the shared $TMPDIR fallback, where a real corgi-voice may listen.
+    expect(paths.socketMoved(paths.socketPath())).toBe(false);
+    const env = { socket: paths.socketPath(), dir };
+    const made = await prepare(env);
+    if (made && typeof (made as { close?: unknown }).close === "function") servers.push(made as { close(): void });
+    process.stdout.write = ((t: string) => (out.push(t), true)) as typeof process.stdout.write;
+    process.stderr.write = ((t: string) => (err.push(t), true)) as typeof process.stderr.write;
+    const running = main(args, { terminal: false });
+    await during({ ...env, printed: () => out.join("") });
+    const code = await running;
+    return { code, out: out.join(""), err: err.join(""), env, after: after() };
+  } finally {
+    process.stdout.write = write;
+    process.stderr.write = ewrite;
+    for (const s of servers) s.close();
+    for (const [k, v] of saved) v === undefined ? delete process.env[k] : (process.env[k] = v);
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("--toggle-mute mutes and prints the muted line, then unmutes (US1 scenarios 1 and 2)", async () => {
+  const session = stubSession(),
+    serve = ({ socket }: { socket: string }) =>
+      startServer({ path: socket, session, recorder: stubRecorder(), pid: 4242 });
+  let r = await command(["--toggle-mute"], serve);
+  expect([r.code, r.out, r.err]).toEqual([0, "muted · bat · corgi-voice\n", ""]);
+  expect(session.muted).toBe(true);
+  expect(session.events).toEqual(["muted from outside"]);
+  r = await command(["--toggle-mute"], serve);
+  expect([r.code, r.out, r.err]).toEqual([0, "listening · bat · corgi-voice\n", ""]);
+  expect(session.events).toEqual(["muted from outside", "unmuted from outside"]);
+  r = await command(["--mute"], serve);
+  expect([r.code, r.out]).toEqual([0, "muted · bat · corgi-voice\n"]);
+  r = await command(["--unmute"], serve);
+  expect([r.code, r.out]).toEqual([0, "listening · bat · corgi-voice\n"]);
+});
+
+test("a refused unmute prints the reason on stderr, the state on stdout, and returns 1 (US1 scenario 3)", async () => {
+  const session = stubSession();
+  session.muted = true;
+  session.unavailable = "mic_missing";
+  const serve = ({ socket }: { socket: string }) =>
+    startServer({ path: socket, session, recorder: stubRecorder(), pid: 4242 });
+  for (const flag of ["--unmute", "--toggle-mute"]) {
+    const r = await command([flag], serve);
+    expect([r.code, r.out, r.err]).toEqual([
+      1,
+      "muted · cannot listen: microphone missing\n",
+      "corgi-voice: cannot unmute: microphone missing\n",
+    ]);
+  }
+  session.unavailable = "server_down";
+  expect((await command(["--unmute"], serve)).err).toBe("corgi-voice: cannot unmute: transcription server down\n");
+  expect([session.muted, session.events]).toEqual([true, []]);
+});
+
+test("without a corgi-voice, or with one that does not answer, the commands return 3 (US1 scenarios 4 and 6)", async () => {
+  for (const flag of ["--mute", "--unmute", "--toggle-mute", "--status", "--watch"]) {
+    const r = await command([flag]);
+    expect([flag, r.code, r.out, r.err]).toEqual([flag, 3, "", "corgi-voice is not running\n"]);
+  }
+  // A stuck corgi-voice: it accepts and never answers.
+  const started = performance.now(),
+    r = await command(["--toggle-mute"], ({ socket }) => {
+      const server = Bun.listen({ unix: socket, socket: { data() {} } });
+      return { close: () => server.stop(true) };
+    });
+  expect([r.code, r.out, r.err]).toEqual([3, "", "corgi-voice did not answer\n"]);
+  // The full second, and not much more.
+  expect(performance.now() - started).toBeGreaterThanOrEqual(950);
+  expect(performance.now() - started).toBeLessThan(2500);
+});
+
+test("control flags mixed with each other or with voice-window flags are usage errors", async () => {
+  for (const bad of [
+    ["--mute", "--unmute"],
+    ["--toggle-mute", "--status"],
+    ["--status", "--status"],
+    ["--mute", "--model", "base.en"],
+    ["--status", "--verbose"],
+    ["--watch", "--corgi", "corgi"],
+    ["--status", "--setup"],
+    ["--status", "--help"],
+    ["--json"],
+    ["--json", "--mute"],
+    ["--toggle-mute", "--json"],
+  ]) {
+    expect(() => flags(bad)).toThrow("Usage");
+    const r = await command(bad);
+    expect([bad.join(" "), r.code]).toEqual([bad.join(" "), 2]);
+  }
+  expect(flags(["--status", "--json"])).toEqual({ control: "status", json: true });
+  expect(flags(["--json", "--watch"])).toEqual({ control: "watch", json: true });
+  expect(flags(["--toggle-mute"])).toEqual({ control: "toggle" });
+  for (const flag of ["--mute", "--unmute", "--toggle-mute", "--status", "--watch", "--json"]) expect(usage).toContain(flag);
+});
+
+test("a control command reads no settings, runs no migration and takes no lock (FR-010)", async () => {
+  const plant = () => {
+    // The in-Corgi voice mode's settings, which a voice start would take over.
+    const old = paths.oldSettingsFile();
+    mkdirSync(dirname(old), { recursive: true });
+    writeFileSync(old, JSON.stringify({ threshold: 30 }));
+  };
+  const left = () => [existsSync(paths.settingsFile()), existsSync(paths.lockFile())];
+  // Nothing running, and a corgi-voice that answers: the same either way.
+  const none = await command(["--status"], plant, async () => {}, left);
+  expect([none.code, none.after]).toEqual([3, [false, false]]);
+  const served = await command(
+    ["--toggle-mute"],
+    ({ socket }) => (plant(), startServer({ path: socket, session: stubSession(), recorder: stubRecorder(), pid: 1 })),
+    async () => {},
+    left,
+  );
+  expect([served.code, served.after]).toEqual([0, [false, false]]);
+});
+
+test("--status prints the short line, --status --json the state alone (US2 scenarios 1 and 2)", async () => {
+  const session = stubSession(),
+    recorder = stubRecorder(),
+    serve = ({ socket }: { socket: string }) => startServer({ path: socket, session, recorder, pid: 4242 });
+  let r = await command(["--status"], serve);
+  expect([r.code, r.out, r.err]).toEqual([0, "listening · bat · corgi-voice\n", ""]);
+  r = await command(["--status", "--json"], serve);
+  expect(r.code).toBe(0);
+  expect(r.out.endsWith("\n") && r.out.split("\n").length).toBe(2);
+  expect(JSON.parse(r.out)).toEqual({
+    pid: 4242,
+    muted: false,
+    mode: "listening",
+    unavailable: null,
+    reason: null,
+    recording: "none",
+    target: { machine: "local", label: "bat · corgi-voice" },
+    updated_at: expect.any(Number),
+  });
+  // The window's other forms, as the state module words them.
+  recorder.set("paused");
+  session.viewer = false;
+  session.focus = null;
+  session.reason = "marovo unreachable: timed out";
+  expect((await command(["--status"], serve)).out).toBe("listening · marovo unreachable · REC paused\n");
+  // --status changes nothing.
+  expect([session.muted, session.events]).toEqual([false, []]);
+});
+
+test("--watch prints the state, a line per change, and returns 0 when corgi-voice quits (US2 scenario 3)", async () => {
+  for (const json of [false, true]) {
+    const session = stubSession(),
+      recorder = stubRecorder();
+    let server: { close(): void } | null = null;
+    const r = await command(
+      json ? ["--watch", "--json"] : ["--watch"],
+      async ({ socket }) => (server = await startServer({ path: socket, session, recorder, pid: 4242 })),
+      async ({ printed }) => {
+        // The first line is in before the first change.
+        for (let i = 0; i < 300 && !printed().includes("\n"); i++) await Bun.sleep(10);
+        session.setMuted(true);
+        await Bun.sleep(20);
+        recorder.set("running");
+        await Bun.sleep(20);
+        session.focus = "api · logs";
+        session.changed();
+        await Bun.sleep(1100);
+        // Past the 1 s answer timeout, the watch goes on.
+        recorder.set("stopping");
+        await Bun.sleep(50);
+        server!.close();
+      },
+    );
+    expect([json, r.code, r.err]).toEqual([json, 0, ""]);
+    const lines = r.out.trimEnd().split("\n");
+    if (json)
+      expect(lines.map(l => JSON.parse(l)).map(s => [s.mode, s.recording, s.target.label])).toEqual([
+        ["listening", "none", "bat · corgi-voice"],
+        ["muted", "none", "bat · corgi-voice"],
+        ["muted", "running", "bat · corgi-voice"],
+        ["muted", "running", "api · logs"],
+        ["muted", "none", "api · logs"],
+      ]);
+    else
+      expect(lines).toEqual([
+        "listening · bat · corgi-voice",
+        "muted · bat · corgi-voice",
+        "muted · bat · corgi-voice · REC",
+        "muted · api · logs · REC",
+        "muted · api · logs",
+      ]);
+  }
+}, 15_000);

@@ -25,10 +25,28 @@ import { Recorder } from "./voice/recorder";
 import { Server } from "./voice/whisper";
 import { VoiceSession } from "./voice/session";
 import { CorgiLink } from "./corgi/link";
+import { startServer } from "./control/server";
+import * as client from "./control/client";
+import { shortLine, cannot_listen, type VoiceState } from "./control/state";
 import { resolveCorgi, checkCapabilities } from "./corgi/command";
 
 export const version: string = pkg.version;
-type Flags = settings.VoiceFlags & { verbose?: boolean; setup?: boolean; help?: boolean };
+/** What a control command asks the running corgi-voice. */
+type Control = "mute" | "unmute" | "toggle" | "status" | "watch";
+type Flags = settings.VoiceFlags & {
+  verbose?: boolean;
+  setup?: boolean;
+  help?: boolean;
+  control?: Control;
+  json?: boolean;
+};
+const control_flags: Record<string, Control> = {
+  "--mute": "mute",
+  "--unmute": "unmute",
+  "--toggle-mute": "toggle",
+  "--status": "status",
+  "--watch": "watch",
+};
 
 export const usage = `corgi-voice ${version}: voice dictation and transcripts for Corgi
 
@@ -36,6 +54,8 @@ Usage:
   corgi-voice [--model NAME] [--threshold N] [--silence S] [--port N] [--device NAME]
               [--transcripts DIR] [--no-filter] [--verbose] [--corgi CMD]
   corgi-voice --setup [--model NAME] [--corgi CMD]
+  corgi-voice --mute | --unmute | --toggle-mute
+  corgi-voice --status [--json] | --watch [--json]
   corgi-voice --help
 
 Flags:
@@ -50,6 +70,14 @@ Flags:
   --corgi CMD        the corgi command: a name on PATH or a path (default: corgi)
   --setup            check tools and download the model and the speech filter
   --help             show this help
+
+Control the running corgi-voice (no terminal needed):
+  --mute, --unmute   mute or unmute dictation, as m does
+  --toggle-mute      unmute when MUTED shows, else mute
+  --status           print the state as one line
+  --watch            print the state, then a line on every change
+  --json             with --status or --watch: the state as JSON
+  Exit: 0 done, 1 refused, 2 usage, 3 not running or no answer within 1 s
 `;
 
 /** Reads the arguments; anything else is a usage error. */
@@ -108,12 +136,28 @@ export function flags(args: string[]): Flags {
       case "-h":
         out.help = true;
         break;
+      case "--mute":
+      case "--unmute":
+      case "--toggle-mute":
+      case "--status":
+      case "--watch":
+        // One control flag at a time.
+        if (out.control) throw Error("Usage");
+        out.control = control_flags[args[i]];
+        break;
+      case "--json":
+        if (out.json) throw Error("Usage");
+        out.json = true;
+        break;
       default:
         throw Error("Usage");
     }
   }
   // Setup takes only the model and the corgi command.
   if (out.setup && Object.keys(out).some(k => !["setup", "model", "corgi"].includes(k))) throw Error("Usage");
+  // A control command takes only --json, and --json only goes with the state.
+  if (out.control && Object.keys(out).some(k => !["control", "json"].includes(k))) throw Error("Usage");
+  if (out.json && out.control !== "status" && out.control !== "watch") throw Error("Usage");
   return out;
 }
 function throwUsage(): never {
@@ -144,6 +188,40 @@ export function message(error: unknown, s: { model: string; port: number | null 
     default:
       return name ?? String(error);
   }
+}
+/** A control command (FR-007, FR-008): asks the running corgi-voice and
+ * prints the state it answers, a short line or the JSON state. Returns 0
+ * when done, 1 when refused (the reason on stderr), 3 when no corgi-voice
+ * runs or answers in time. */
+async function control(op: Control, json: boolean): Promise<number> {
+  const print = (state: VoiceState) => void process.stdout.write(`${json ? JSON.stringify(state) : shortLine(state)}\n`),
+    gone = (why: "not_running" | "no_answer") => {
+      process.stderr.write(why === "not_running" ? "corgi-voice is not running\n" : "corgi-voice did not answer\n");
+      return 3;
+    };
+  let path: string;
+  try {
+    path = paths.socketPath();
+  } catch (error) {
+    // A folder for the socket that is not safe to use: no corgi-voice can listen there.
+    process.stderr.write(`corgi-voice: ${(error as { detail?: string }).detail ?? errors.name(error)}\n`);
+    return 3;
+  }
+  if (op === "watch") {
+    const end = await client.watch(path, answer => print(answer.state));
+    return end === "closed" ? 0 : gone(end);
+  }
+  const got = await client.request(path, op);
+  if (!got.ok) return gone(got.why);
+  const answer = got.answer;
+  print(answer.state);
+  if (answer.ok) return 0;
+  const why =
+    answer.err === "cannot_listen" && answer.state.unavailable
+      ? `cannot unmute: ${cannot_listen[answer.state.unavailable]}`
+      : `request refused: ${answer.err}`;
+  process.stderr.write(`corgi-voice: ${why}\n`);
+  return 1;
 }
 /** The `corgi` command for this run, checked; throws `CorgiMissing` with the reason as `detail`. */
 async function corgiCommand(s: settings.VoiceSettings): Promise<string> {
@@ -176,6 +254,9 @@ export async function main(args: string[], opts: { terminal?: boolean } = {}): P
     process.stdout.write(usage);
     return 0;
   }
+  // Before setup and the terminal check: a hotkey tool has no terminal, and
+  // a control command reads no settings and takes over nothing (FR-010).
+  if (given.control) return control(given.control, !!given.json);
   // Setup takes over the old settings itself, then reads what it lacks from them.
   if (given.setup) return setup.run({ model: given.model, corgi: given.corgi });
   if (!(opts.terminal ?? (process.stdin.isTTY && process.stdout.isTTY))) {
@@ -233,12 +314,15 @@ export type Held = {
   recordings?: () => { path: string; late: number }[];
   /** Gives the terminal back as it was. */
   terminal?: () => void;
+  /** Stops the control channel and removes its socket, at once. */
+  control?: () => void;
 };
 /**
  * The one way corgi-voice ends. `cleanup` gives back what `held` has at that
  * moment, once (later calls wait for the same run), and one step failing
  * does not stop the next: the terminal first, so what is printed can be
- * read; the recordings, closed without waiting, with a line for each that
+ * read; the control channel, so nothing from outside acts on what is
+ * ending; the recordings, closed without waiting, with a line for each that
  * left passages out; the microphone; the link; whisper-server; the lock last.
  * `arm` makes SIGINT, SIGTERM, SIGHUP, an uncaught error and an unhandled
  * rejection run it and exit with status 1, through `signal` and `crash`;
@@ -261,6 +345,7 @@ export function ending(
     (done ??= (async () => {
       held.ended = true;
       attempt(() => held.terminal?.());
+      attempt(() => held.control?.());
       attempt(() => {
         for (const { path, late } of held.recordings?.() ?? []) if (late) write(lateMessage(path, late));
       });
@@ -284,6 +369,8 @@ export function ending(
     exiting = () => {
       attempt(() => held.terminal?.());
       void cleanup();
+      // The lock, which a dead process would leave behind (cleanup's
+      // synchronous part has closed the control socket already).
       attempt(() => held.lock?.());
     },
     signals = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
@@ -291,6 +378,7 @@ export function ending(
     cleanup,
     signal,
     crash,
+    exiting,
     arm(): void {
       for (const name of signals) process.on(name, signal);
       process.on("uncaughtException", crash);
@@ -379,6 +467,27 @@ async function voice(
   });
   held.link = () => session.close();
   const muting = muteWhileRecording(session);
+  // The control channel, for a hotkey and status bars (FR-001): the lock is
+  // held, so a socket file already there is a dead corgi-voice's. Without
+  // it the window still works; it says so.
+  try {
+    const path = paths.socketPath();
+    if (paths.socketMoved(path)) logger.info("control: the usual socket path is too long", { path });
+    const channel = await startServer({
+      path,
+      session,
+      recorder,
+      pid: process.pid,
+      log: line => logger.info(line),
+    });
+    held.control = channel.close;
+    // Ended while it started: nothing gives it back later.
+    if (held.ended) channel.close();
+  } catch (error) {
+    logger.warn("control channel", { error });
+    const detail = (error as { detail?: string }).detail ?? (error instanceof Error ? error.message : String(error));
+    notices = [...notices, `No control channel (${detail}): corgi-voice --toggle-mute and --status cannot reach this window`];
+  }
   // After each wait: a signal may have ended corgi-voice meanwhile, and
   // what is started behind its cleanup would be left running.
   const going = () => {

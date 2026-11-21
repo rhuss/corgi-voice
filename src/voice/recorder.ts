@@ -52,6 +52,7 @@ export class Recorder {
   /** Why the last recording could not start or stopped writing. */
   error: string | null = null;
   notices: Notice[] = [];
+  private listeners: (() => void)[] = [];
   constructor(
     private deps: {
       tuning: Tuning;
@@ -61,6 +62,13 @@ export class Recorder {
       active?: (on: boolean) => void;
     },
   ) {}
+  /** `fn` runs after a recording starts, pauses, resumes, stops or closes. */
+  on(_event: "change", fn: () => void): void {
+    this.listeners.push(fn);
+  }
+  private changed(): void {
+    for (const fn of this.listeners) fn();
+  }
   /** Adds a line to the history. */
   notice(kind: Notice["kind"], text: string): void {
     this.notices.push({ at: this.deps.now(), kind, text });
@@ -97,6 +105,7 @@ export class Recorder {
     this.deps.log?.(`recording: started ${path}`);
     this.notice("info", `recording started: ${path}`);
     this.deps.active?.(true);
+    this.changed();
     return { path };
   }
   private refuse(path: string, why: string): { error: string } {
@@ -114,6 +123,7 @@ export class Recorder {
     this.reserve(r);
     this.deps.log?.(`recording: paused ${r.path}`);
     this.notice("info", "paused");
+    this.changed();
   }
   /** Back into the same file; the first passage spoken since the pause starts
    * a contribution. */
@@ -125,6 +135,7 @@ export class Recorder {
     r.turns.breakAt(r.paused_at);
     this.deps.log?.(`recording: resumed ${r.path}`);
     this.notice("info", "resumed");
+    this.changed();
   }
   /** Stops the current recording at once and closes its file once its pending
    * passages are written, or after `timeoutMs` (10 s unless given); `late`
@@ -152,6 +163,7 @@ export class Recorder {
     this.deps.tuning.end();
     this.deps.active?.(false);
     r.done = this.close(r, timeoutMs);
+    this.changed();
     return r.done;
   }
   private async close(r: Recording, timeoutMs: number): Promise<{ path: string; late: number }> {
@@ -191,6 +203,7 @@ export class Recorder {
       }
       if (late) this.notice("error", `${late} passage${late === 1 ? "" : "s"} did not finish in time`);
     }
+    this.changed();
     return { path: r.path, late };
   }
   /** Quitting without waiting any longer: stops the current recording and
@@ -351,5 +364,6 @@ export class Recorder {
       "error",
       `recording stopped: ${why}` + (lost ? `; ${lost} passage${lost === 1 ? "" : "s"} not written` : ""),
     );
+    this.changed();
   }
 }

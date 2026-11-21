@@ -1542,3 +1542,18 @@ test("the window keeps every tuning control: threshold, options, filter, device,
   for (const label of ["silence", "burst", "filter"]) expect(rows[6]).toContain(label);
   for (const label of ["pre-roll", "min speech"]) expect(rows[7]).toContain(label);
 });
+
+test("a mute from outside shows as a history row among what was said", () => {
+  const { ui, session } = setup();
+  session.history = [
+    { ...said(1, "delivered", "first"), captured_at: 1000 },
+    { ...said(2, "muted", null), captured_at: 3000 },
+  ];
+  session.events.push({ at: 2000, text: "muted from outside" });
+  const lines = screen(ui.draw(80, 20), 80, 20)
+    .slice(9, 18)
+    .map(r => r.trim())
+    .filter(Boolean);
+  expect(lines.map(l => l.replace(/\d\d:\d\d:\d\d /, ""))[0]).toBe("✓ first");
+  expect(lines.map(l => l.replace(/\d\d:\d\d:\d\d /, ""))[1]).toBe("○ muted from outside");
+});

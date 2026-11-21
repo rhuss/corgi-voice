@@ -13,13 +13,14 @@ import { displayWidth, ellipsis, spaced } from "../util/text";
 import { thumb } from "./scroll_thumb";
 import { Screen, rows as frameRows } from "./screen";
 import { FilePrompt } from "./prompt";
-import type { VoiceSession, Utterance, GaugeRow } from "../voice/session";
+import type { VoiceSession, Utterance, GaugeRow, SessionEvent } from "../voice/session";
 import type { Device } from "../voice/capture";
 import type { Timing } from "../voice/segmenter";
 import type { Recorder } from "../voice/recorder";
 import type { Tuning } from "../voice/tuning";
 import { Reading, clock, wrap } from "../voice/reading";
 import { isMismatch } from "../corgi/errors";
+import { shownMuted, target } from "../control/state";
 
 const reset = "\x1b[0m",
   meter_cells = 20,
@@ -259,15 +260,6 @@ function linkStatus(session: VoiceSession): string | null {
       return null;
   }
 }
-/** Where the next text goes: the pane's label, after its machine when that is
- * not the local one; or why nothing would be typed. */
-export function target(s: VoiceSession): string {
-  // "Corgi unreachable", "marovo unreachable", "no viewer attached": the reason's head.
-  if (!s.viewer) return (s.reason ?? (s.link_state === "lost" ? "Corgi unreachable" : "no viewer attached")).split(":")[0];
-  const machine = s.machine ?? "local";
-  if (!s.focus) return machine;
-  return machine !== "local" ? `${machine} → ${s.focus}` : s.focus;
-}
 /** The mode: MUTED or Listening (a voice that cannot listen counts as
  * muted). The note in the title adds whether Corgi answers and has a viewer,
  * and what speech is doing. */
@@ -280,8 +272,8 @@ export function mode(s: VoiceSession): {
   label_style: string;
 } {
   const off = { muted: true, label: "MUTED", label_style: hotBold };
-  if (!s.available) return { note: "○", style: warm, ...off };
-  if (s.muted) return { note: "♫", style: muted, ...off };
+  // The one rule for MUTED, shared with the control channel's state.
+  if (shownMuted(s)) return s.available ? { note: "♫", style: muted, ...off } : { note: "○", style: warm, ...off };
   const on = { muted: false, label: "Listening", label_style: strong };
   // Nowhere for text to go: grey until Corgi answers with a viewer.
   if (s.link_state !== "connected" || !s.viewer) return { note: "♫", style: muted, ...on };
@@ -319,11 +311,18 @@ export function gaugeRow(g: GaugeRow): Row {
 }
 /** The meter cell of the threshold marker for `pct`. */
 const markerCell = (pct: number) => Math.min(meter_cells - 1, Math.round((pct / 100) * meter_cells));
-/** The history: what was said, the gauges and the recording's notices, in time order. */
-function historyRows(history: Utterance[], recorder: Recorder | undefined, gauges: GaugeRow[] = []): Row[] {
+/** The history: what was said, the gauges, the recording's notices and the
+ * session's own rows (a mute from outside), in time order. */
+function historyRows(
+  history: Utterance[],
+  recorder: Recorder | undefined,
+  gauges: GaugeRow[] = [],
+  events: SessionEvent[] = [],
+): Row[] {
   const said = history.map(u => ({ at: u.captured_at, row: row(u) })).filter(r => r.row !== null),
     notes = [
       ...gauges.map(g => ({ at: g.at, row: gaugeRow(g) })),
+      ...events.map(e => ({ at: e.at, row: { glyph: "○", style: quiet, label: e.text, time: clock(e.at), latency: null } })),
       ...(recorder?.notices ?? []).map(n => ({
       at: n.at,
       row: {
@@ -625,7 +624,7 @@ export class VoiceUi {
       const bar = thumb(height, lines.length, first);
       if (bar) for (let i = 0; i < bar.len; i++) frame += at(top + bar.start + i, cols - 1) + muted + "┃" + reset;
     } else {
-      const shown = historyRows(s.history, this.opts.recorder, s.gauges);
+      const shown = historyRows(s.history, this.opts.recorder, s.gauges, s.events);
       this.scroll = Math.max(0, Math.min(this.scroll, shown.length - height));
       const last = shown.length - this.scroll,
         first = Math.max(0, last - height);
