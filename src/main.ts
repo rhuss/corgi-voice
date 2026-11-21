@@ -183,6 +183,8 @@ export function message(error: unknown, s: { model: string; port: number | null 
       return "whisper-server stopped while starting; run with --verbose and see voice.log";
     case "TerminalRequired":
       return "corgi-voice needs a terminal";
+    case "NoWorkingFolder":
+      return "the current folder no longer exists (it was removed); cd to another folder and start corgi-voice again";
     case "Usage":
       return "usage: corgi-voice [flags]; see corgi-voice --help";
     default:
@@ -240,6 +242,16 @@ export function ownPaneFrom(env: NodeJS.ProcessEnv = process.env): number | null
   const pane = Number(value);
   return Number.isSafeInteger(pane) ? pane : null;
 }
+/** Whether the process's working folder still exists: `process.cwd()`
+ * throws once it was removed under a running shell. */
+export function workingFolder(cwd: () => string = process.cwd): boolean {
+  try {
+    cwd();
+    return true;
+  } catch {
+    return false;
+  }
+}
 /** `corgi-voice …`; returns the exit status. `terminal` stands in for the
  * check that stdin and stdout are a terminal, for tests. */
 export async function main(args: string[], opts: { terminal?: boolean } = {}): Promise<number> {
@@ -257,6 +269,12 @@ export async function main(args: string[], opts: { terminal?: boolean } = {}): P
   // Before setup and the terminal check: a hotkey tool has no terminal, and
   // a control command reads no settings and takes over nothing (FR-010).
   if (given.control) return control(given.control, !!given.json);
+  // A removed working folder breaks Bun's terminal streams (and relative
+  // --transcripts paths): say so instead of crashing inside Bun.
+  if (!workingFolder()) {
+    process.stderr.write(`corgi-voice: ${message(Error("NoWorkingFolder"), { model: "", port: null })}\n`);
+    return 1;
+  }
   // Setup takes over the old settings itself, then reads what it lacks from them.
   if (given.setup) return setup.run({ model: given.model, corgi: given.corgi });
   if (!(opts.terminal ?? (process.stdin.isTTY && process.stdout.isTTY))) {

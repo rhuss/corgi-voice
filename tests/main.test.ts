@@ -11,6 +11,7 @@ import {
   usage,
   version,
   main,
+  workingFolder,
   ownPaneFrom,
   ending,
   type Held,
@@ -899,3 +900,21 @@ test("--watch prints the state, a line per change, and returns 0 when corgi-voic
       ]);
   }
 }, 15_000);
+
+test("a removed working folder is reported, not a crash inside Bun", async () => {
+  expect(workingFolder(() => "/x")).toBe(true);
+  expect(
+    workingFolder(() => {
+      throw Object.assign(Error("ENOENT: process.cwd failed"), { code: "ENOENT" });
+    }),
+  ).toBe(false);
+  // The real thing: a process whose working folder is removed under it.
+  const dir = mkdtempSync(join(tmpdir(), "cv-gone-")),
+    entry = resolve(import.meta.dir, "../src/main.ts"),
+    code = `import { rmSync } from "node:fs"; process.chdir(${JSON.stringify(dir)}); rmSync(${JSON.stringify(dir)}, { recursive: true }); const { main } = await import(${JSON.stringify(entry)}); process.exit(await main([]));`,
+    child = Bun.spawn(["bun", "-e", code], { stdout: "pipe", stderr: "pipe", stdin: "ignore" }),
+    [stderr, status] = await Promise.all([new Response(child.stderr).text(), child.exited]);
+  expect(status).toBe(1);
+  expect(stderr).toContain("the current folder no longer exists");
+  expect(stderr).not.toContain("TypeError");
+});
