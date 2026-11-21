@@ -1,7 +1,8 @@
 //! Transcript recording: the passages Whisper hears while a recording runs go
 //! to its file one line at a time, split into contributions by `Turns`. A
 //! passage belongs to the recording that ran when its speech ended, so a
-//! stopping recording still takes its own passages after a new one starts.
+//! stopping recording still takes its own passages after a new one starts. A
+//! stop cuts the passage in progress, so what was said before it is written.
 import { TranscriptFile } from "./transcript";
 import { Turns, speakerDash } from "./turns";
 import type { Tuning } from "./tuning";
@@ -127,14 +128,23 @@ export class Recorder {
   }
   /** Stops the current recording at once and closes its file once its pending
    * passages are written, or after `timeoutMs` (10 s unless given); `late`
-   * counts those left out. Null when nothing was recording. */
+   * counts those left out. A running recording cuts the passage in progress
+   * at the stop (FR-001): its part so far is the recording's, the rest is
+   * not. Null when nothing was recording. */
   stop(timeoutMs = stop_wait_ms): Promise<{ path: string; late: number }> | null {
     const r = this.current;
     if (!r) return null;
     r.stopped_at = this.deps.now();
     if (r.state === "running") {
+      // Before the span ends: the cut part's speech can end at the stop
+      // itself, or a frame after it on the segmenter's count, and `claim`
+      // gives it to `r` only while `r` still runs.
+      const u = this.inProgress();
+      if (u) {
+        this.deps.log?.(`recording: cut utterance ${u.id} at the stop of ${r.path}`);
+        this.cut();
+      }
       this.endSpan(r, r.stopped_at);
-      this.reserve(r);
     }
     r.state = "stopping";
     this.current = null;
@@ -195,36 +205,65 @@ export class Recorder {
     });
   }
   /** Tells the recorder which passage is being spoken, if any (the session's
-   * utterance in progress), so a pause or stop keeps it for the recording when
-   * its speech may already have ended. */
-  track(inProgress: () => Utterance | null, speechEnd: () => number | null = () => null): void {
+   * utterance in progress), so a pause keeps it for the recording when its
+   * speech may already have ended; and how to `cut` it, which a stop does:
+   * the part so far ends there and is claimed as any passage that ended. */
+  track(
+    inProgress: () => Utterance | null,
+    speechEnd: () => number | null = () => null,
+    cut: () => void = () => {},
+  ): void {
     this.inProgress = inProgress;
     this.speechEnd = speechEnd;
+    this.cut = cut;
   }
   private inProgress: () => Utterance | null = () => null;
+  private cut: () => void = () => {};
   /** Where the speech of the passage in progress ended so far (ms), or null. */
   private speechEnd: () => number | null = () => null;
   private endSpan(r: Recording, at: number): void {
     const last = r.spans.at(-1);
     if (last && last.to === null) last.to = at;
   }
-  /** Lets go of the passage in progress that `r` holds since its pause or
-   * stop unless its speech, as far as it went, ended while `r` ran: speech
-   * that went on past the pause or stop is no passage of `r`'s, and not late.
+  /** Lets go of the passage in progress that `r` holds since its pause
+   * unless its speech, as far as it went, ended while `r` ran: speech that
+   * went on past the pause is no passage of `r`'s, and not late.
    * One that did end in time stays held and counts as late when `r` closes
-   * without it. */
+   * without it. `letGoIfContinued` lets go of the first kind as soon as the
+   * speech gets there; this catches what is left when `r` closes. */
   private unreserve(r: Recording): void {
     const u = this.inProgress(),
       end = this.speechEnd();
     if (u?.record === r && (end === null || !this.ranAt(r, end)) && r.pending.delete(u)) u.record = null;
   }
+  /** Lets go of the passage in progress held by a recording since its pause
+   * (stopped since, or not) once its speech, as the segmenter measures it
+   * (short bursts do not count), reaches or passes the pause: from then on it
+   * can no longer have ended while that recording ran, so the recording need
+   * not wait for it, nor count it as late. A stop with nothing else pending
+   * closes at once. The session calls this on each frame while a passage is
+   * in progress. */
+  letGoIfContinued(): void {
+    const u = this.inProgress(),
+      r = u?.record;
+    if (!u || !r || (r.state !== "paused" && r.state !== "stopping")) return;
+    const end = this.speechEnd(),
+      held_at = r.spans.at(-1)?.to;
+    // The same boundary as `ranAt`: speech that ends at the pause ended after it.
+    if (end === null || held_at == null || end < held_at) return;
+    this.deps.log?.(`recording: let go of utterance ${u.id}, its speech went on past the pause of ${r.path}`);
+    this.release(u);
+    u.record = null;
+  }
   /** Whether `r` was running at `at` (ms). */
   private ranAt(r: Recording, at: number): boolean {
     return r.spans.some(s => s.from <= at && (s.to === null || at < s.to));
   }
-  /** Holds the passage in progress for `r` as it pauses or stops: its speech
-   * may have ended while `r` ran, and the file must stay open for it. `claim`
-   * settles it once the speech is known to have ended. */
+  /** Holds the passage in progress for `r` as it pauses: its speech may have
+   * ended while `r` ran, and the file must stay open for it should `r` stop.
+   * `claim` settles it once the speech is known to have ended;
+   * `letGoIfContinued` lets go of it as soon as the speech goes on past the
+   * pause. */
   private reserve(r: Recording): void {
     const u = this.inProgress();
     if (!u || u.record) return;
@@ -234,8 +273,8 @@ export class Recorder {
   /**
    * Assigns `u`, whose speech just ended, to the recording that was running
    * when it ended (FR-004a): the current one, or one that stopped or paused
-   * since, which waits for it. A passage held at a pause or stop whose speech
-   * went on past it is let go and assigned like any other.
+   * since, which waits for it. A passage held at a pause whose speech went on
+   * past it is let go and assigned like any other.
    */
   claim(u: Utterance): void {
     const at = u.speech_end;

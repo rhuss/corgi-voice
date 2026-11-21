@@ -11,7 +11,7 @@
 import * as subprocess from "../util/subprocess";
 import { Failure } from "../util/failure";
 import { controls } from "../util/text";
-import { firstLine, notFound } from "./errors";
+import { firstLine, jsonFrom, notFound, refusal, refused } from "./errors";
 import {
   parseReply,
   resolve,
@@ -51,16 +51,6 @@ export function blank(name: string): Machine {
 /** The argv for `cmd` on `machine`: `--machine` is left out for the local one. */
 export function on(cmd: string, machine: string, ...args: string[]): string[] {
   return machine === "local" ? [cmd, ...args] : [cmd, "--machine", machine, ...args];
-}
-/** The JSON object in `text` from its first `{`, past any notice before it, or null. */
-export function jsonFrom(text: string): unknown {
-  const at = text.indexOf("{");
-  if (at < 0) return null;
-  try {
-    return JSON.parse(text.slice(at));
-  } catch {
-    return null;
-  }
 }
 /** Whether `name` can go after `--machine` as a value: never an option, no spaces or controls. */
 export function machineName(name: unknown): name is string {
@@ -274,7 +264,7 @@ export class Poller {
     }
     if (loop.stopped) return;
     if (out.timedOut) return this.fail(m, "no answer in time");
-    if (out.code !== 0) return this.fail(m, refused(jsonFrom(out.stdout)) ?? firstLine(out.stderr, out.code));
+    if (out.code !== 0) return this.fail(m, refusal(out.stdout, out.stderr) ?? firstLine(out.stderr, out.code));
     this.take(m, jsonFrom(out.stdout));
   }
   /** A machine's `list --json` reply, parsed (from its own call or `--all-machines`). */
@@ -300,23 +290,20 @@ export class Poller {
     m.state = "unreachable";
     m.error = why;
   }
-  /** Announces the target when it, its label or the reason changed. */
+  /** Announces the target when it, its label, the reason or the machine the
+   * reason comes from changed: the same reason from another machine changes
+   * whether the window points to voice.json (FR-011). */
   private evaluate(): void {
     if (this.stopped) return;
     const r = this.resolve(),
-      key = JSON.stringify(r.target ? [r.target.machine, r.target.pane, r.target.label] : [r.reason]);
+      key = JSON.stringify(r.target ? [r.target.machine, r.target.pane, r.target.label] : [r.reason, r.source]);
     if (key === this.shown) return;
     this.shown = key;
     for (const fn of this.listeners) fn(r);
   }
 }
 /** Why `cmd` could not be run at all: not found, or what the spawn failed with. */
-function unstarted(cmd: string, error: unknown): string {
+export function unstarted(cmd: string, error: unknown): string {
   const name = (error as Error)?.message;
   return name === "FileNotFound" || name === "AccessDenied" ? notFound(cmd) : String(name);
-}
-/** The `err` of a reply with `ok: false`, if that is what `reply` is. */
-function refused(reply: unknown): string | null {
-  const r = reply && typeof reply === "object" ? (reply as Record<string, unknown>) : null;
-  return r && r.ok === false && typeof r.err === "string" ? r.err : null;
 }

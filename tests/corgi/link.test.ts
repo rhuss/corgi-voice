@@ -38,7 +38,7 @@ async function rejection(p: Promise<unknown>): Promise<string> {
 
 test("watch resolves with the first view of the target", async () => {
   const { link } = make();
-  expect(await link.watch()).toEqual({ viewer: true, focus: "shell", machine: "local", reason: null, why: null });
+  expect(await link.watch()).toEqual({ viewer: true, focus: "shell", machine: "local", reason: null, why: null, source: null });
 });
 
 test("the delivery bound is 2000 ms unless a test shortens it (FR-012)", () => {
@@ -204,7 +204,7 @@ test("viewer events follow the target and its label", async () => {
   await link.watch();
   fake.set({ machines: { local: listReply([{ id: 1, pane: 6, active: 10 }], [{ id: 6, name: "build" }]) } });
   await until(() => seen.at(-1)?.focus === "build");
-  expect(seen.at(-1)).toEqual({ viewer: true, focus: "build", machine: "local", reason: null, why: null });
+  expect(seen.at(-1)).toEqual({ viewer: true, focus: "build", machine: "local", reason: null, why: null, source: null });
   fake.set({ machines: { local: listReply([{ id: 1, pane: null, active: 10 }]) } });
   await until(() => seen.at(-1)?.focus === null);
   expect(seen.at(-1)).toEqual({
@@ -213,6 +213,7 @@ test("viewer events follow the target and its label", async () => {
     machine: null,
     reason: "no viewer attached",
     why: "no_viewer",
+    source: null,
   });
   // Each change is announced once.
   const count = seen.length;
@@ -248,7 +249,7 @@ test("a remote target is typed with --machine, and the window names the machine"
   const seen: Seen[] = [];
   link.on("viewer", s => seen.push(s));
   await onMarovo(link);
-  expect(seen.at(-1)).toEqual({ viewer: true, focus: "agent", machine: "marovo", reason: null, why: null });
+  expect(seen.at(-1)).toEqual({ viewer: true, focus: "agent", machine: "marovo", reason: null, why: null, source: null });
   expect(await link.type("remote words")).toEqual({ machine: "marovo", pane: 70, viewer: 3 });
   const [send] = fake.sends();
   expect(send.argv).toEqual(["--machine", "marovo", "pane", "send", "70", "--stdin"]);
@@ -306,15 +307,16 @@ test("hold-off reasons: no viewer, Corgi not answering, output not understood; p
     machine: null,
     reason: "no viewer attached",
     why: "no_viewer",
+    source: null,
   });
   // Corgi stops answering.
   fake.set({ machines: { local: { stderr: "corgi: daemon not running\n", code: 1 } } });
   await until(() => seen.at(-1)?.reason === "Corgi unreachable: daemon not running");
-  expect(seen.at(-1)?.why).toBe("unreachable");
+  expect(seen.at(-1)).toMatchObject({ why: "unreachable", source: "local" });
   // A viewer attaches: dictation resumes within a poll.
   fake.set(one);
   await until(() => seen.at(-1)?.viewer === true);
-  expect(seen.at(-1)).toEqual({ viewer: true, focus: "shell", machine: "local", reason: null, why: null });
+  expect(seen.at(-1)).toEqual({ viewer: true, focus: "shell", machine: "local", reason: null, why: null, source: null });
 });
 
 test("a first answer without viewers is not understood; the window opens and holds off", async () => {
@@ -325,6 +327,7 @@ test("a first answer without viewers is not understood; the window opens and hol
     machine: null,
     reason: "Corgi output not understood",
     why: "not_understood",
+    source: "local",
   });
   expect(await rejection(link.type("held"))).toBe("NoViewer");
   expect(fake.sends()).toEqual([]);

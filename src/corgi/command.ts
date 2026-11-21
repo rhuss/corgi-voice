@@ -1,14 +1,22 @@
-//! Which `corgi` to run (FR-003) and whether it has what corgi-voice needs (FR-004).
+//! Which `corgi` to run (FR-003), whether it has what corgi-voice needs
+//! (FR-004), and whether it can talk to the Corgi that runs (FR-008).
 import { accessSync, constants, statSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import * as subprocess from "../util/subprocess";
 import * as paths from "../util/paths";
-import { notFound } from "./errors";
+import { classify, firstLine, jsonFrom, notFound, refusal, refused, type Reach } from "./errors";
+import { unstarted } from "./poller";
+import { parseReply, not_understood } from "./viewers";
 
 export type Found = { ok: true; cmd: string } | { ok: false; error: string };
 export type Checked = { ok: true } | { ok: false; error: string };
+/** Whether `corgi list --json` answered with viewer data, else why not, with
+ * the first line of the error. */
+export type Reachable = { kind: "ok" } | { kind: Reach; detail: string };
 /** How long `pane send --help` may take. */
 export const help_ms = 3000;
+/** How long setup's `list --json` probe may take. */
+export const reach_ms = 3000;
 
 function executable(file: string): boolean {
   try {
@@ -61,4 +69,23 @@ export async function checkCapabilities(cmd: string, timeoutMs = help_ms): Promi
     ok: false,
     error: `this corgi (${cmd}) has no "pane send --stdin"; update Corgi to a release that has it`,
   };
+}
+/** Runs `cmd list --json` once, within `timeoutMs`, to see whether this
+ * `corgi` can talk to the Corgi that runs; it never touches a pane. The error
+ * read is the poller's: the `err` of an `{"ok":false}` reply, else standard
+ * error. A reply without `viewers` is a mismatch too. */
+export async function checkReachable(cmd: string, timeoutMs = reach_ms): Promise<Reachable> {
+  let out: subprocess.Result;
+  try {
+    out = await subprocess.run([cmd, "list", "--json"], { timeoutMs });
+  } catch (error) {
+    return { kind: "mismatch", detail: unstarted(cmd, error) };
+  }
+  if (out.timedOut) return { kind: "no_answer", detail: "no answer in time" };
+  const reply = jsonFrom(out.stdout),
+    err = refused(reply);
+  if (out.code === 0 && err === null)
+    return parseReply(reply).ok ? { kind: "ok" } : { kind: "mismatch", detail: not_understood };
+  const text = err ?? refusal(out.stdout, out.stderr) ?? out.stderr;
+  return { kind: classify(text), detail: firstLine(text, out.code) };
 }

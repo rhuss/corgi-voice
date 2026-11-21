@@ -181,6 +181,35 @@ test("a corgi that disappears after startup shows as unreachable and polling goe
   await until(() => seen.at(-1) === `Corgi unreachable: corgi not found: ${fake.cmd}`, 4000);
 });
 
+test("an older corgi's refusal on standard error reads as its err, not as raw JSON", async () => {
+  // The walkthrough's old release: `{"ok":false,...}` on standard error, exit 2.
+  const { poller } = make({
+    machines: { local: { stderr: '{"ok":false,"err":"JSON Parse error: Unexpected identifier \\"HTTP\\""}\n', code: 2 } },
+  });
+  const seen: (string | null)[] = [];
+  poller.on("change", r => seen.push(r.reason));
+  await poller.start();
+  await until(() => seen.length > 0);
+  expect(seen.at(-1)).toBe('Corgi unreachable: JSON Parse error: Unexpected identifier "HTTP"');
+});
+
+test("the same reason from another machine is news: the voice.json hint depends on it (FR-011)", async () => {
+  const misread = { stdout: "not json\n" },
+    { fake, poller } = make({ machineList: machineList(["local", "marovo"]), machines: { local: misread, marovo: misread } });
+  const seen: { reason: string | null; source: string | null }[] = [];
+  poller.on("change", r => seen.push({ reason: r.reason, source: r.source }));
+  await poller.start();
+  await until(() => seen.at(-1)?.source === "local");
+  expect(seen.at(-1)).toEqual({ reason: "Corgi output not understood", source: "local" });
+  // Local stops answering; only marovo's output is not understood now.
+  fake.set({
+    machineList: machineList(["local", "marovo"]),
+    machines: { local: { stderr: "corgi: daemon not running\n", code: 1 }, marovo: misread },
+  });
+  await until(() => seen.at(-1)?.source === "marovo");
+  expect(seen.at(-1)).toEqual({ reason: "Corgi output not understood", source: "marovo" });
+});
+
 test("machine names that would read as options or hold spaces are never passed to --machine", () => {
   expect(machineNames(JSON.stringify({ machines: [{ name: "marovo" }, { name: "--enter" }, { name: "a b" }, { name: "-x" }, { name: "dev.box-1" }] }))).toEqual([
     "marovo",

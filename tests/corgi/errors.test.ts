@@ -1,5 +1,15 @@
 import { test, expect } from "bun:test";
-import { reasonFor, notFound, no_answer, mapping, ssh_patterns } from "../../src/corgi/errors";
+import {
+  reasonFor,
+  notFound,
+  no_answer,
+  mapping,
+  ssh_patterns,
+  classify,
+  isMismatch,
+  reach_patterns,
+  refused,
+} from "../../src/corgi/errors";
 
 test("missing panes read as pane gone", () => {
   for (const name of ["NoPane", "PaneExited", "NoSuchPane"]) {
@@ -80,4 +90,51 @@ test("every ssh pattern is covered, each on a line of its own", () => {
   for (const pattern of ssh_patterns) expect(samples.some(s => pattern.test(s))).toBe(true);
   for (const pattern of ssh_patterns.filter(p => p.source !== "^ssh:"))
     expect(samples.some(s => !s.startsWith("ssh:") && pattern.test(s))).toBe(true);
+});
+
+test("a stopped Corgi reads as not running (FR-008)", () => {
+  for (const text of ["NoRuntime", "corgi: ConnectionRefused", "connect ECONNREFUSED /tmp/corgi.sock"])
+    expect(classify(text)).toBe("not_running");
+});
+
+test("a slow Corgi reads as no answer", () => {
+  expect(classify("RequestTimedOut")).toBe("no_answer");
+});
+
+test("a corgi build that cannot talk to the running Corgi reads as a mismatch", () => {
+  expect(classify('JSON Parse error: Unexpected identifier "HTTP"')).toBe("mismatch");
+  expect(classify("unknown command machine; see corgi --help")).toBe("mismatch");
+  // For setup, anything else is a mismatch too.
+  expect(classify("something nobody expected to see")).toBe("mismatch");
+  expect(classify("")).toBe("mismatch");
+});
+
+test("isMismatch knows only the explicit mismatch patterns", () => {
+  expect(isMismatch('Corgi unreachable: JSON Parse error: Unexpected identifier "HTTP"')).toBe(true);
+  expect(isMismatch("Corgi unreachable: unknown command list; see corgi --help")).toBe(true);
+  expect(isMismatch("Corgi unreachable: Unexpected end of input")).toBe(true);
+  for (const reason of [
+    "Corgi unreachable: NoRuntime",
+    "Corgi unreachable: no answer in time",
+    "Corgi unreachable: something nobody expected to see",
+    "no viewer attached",
+  ])
+    expect(isMismatch(reason)).toBe(false);
+});
+
+test("the reachability table lives next to the error table, one list per class", () => {
+  expect(Object.keys(reach_patterns).sort()).toEqual(["mismatch", "no_answer", "not_running"]);
+  for (const name of ["NoRuntime", "ConnectionRefused"])
+    expect(reach_patterns.not_running.some(p => p.test(name))).toBe(true);
+  expect(reach_patterns.no_answer.some(p => p.test("RequestTimedOut"))).toBe(true);
+  for (const text of ["JSON Parse error", "unknown command", "Unexpected"])
+    expect(reach_patterns.mismatch.some(p => p.test(text))).toBe(true);
+});
+
+test("refused reads the err of an ok:false reply, and nothing else", () => {
+  expect(refused({ ok: false, err: "NoRuntime" })).toBe("NoRuntime");
+  expect(refused({ ok: true, err: "NoRuntime" })).toBeNull();
+  expect(refused({ ok: false })).toBeNull();
+  expect(refused(null)).toBeNull();
+  expect(refused("text")).toBeNull();
 });

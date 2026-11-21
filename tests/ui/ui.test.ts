@@ -7,7 +7,7 @@ import { Segmenter, default_timing } from "../../src/voice/segmenter";
 import type { Device } from "../../src/voice/capture";
 import * as palette from "../../src/ui/palette";
 import { Style } from "../../src/ui/palette";
-import { mkdtempSync, rmSync, statSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Recorder } from "../../src/voice/recorder";
@@ -620,6 +620,7 @@ function recording(opts: Partial<Options> = {}, real?: Tuning) {
   const made = setup({
     recorder,
     folder,
+    home: "/home/me",
     resolveName: (name, dir) => transcript.resolve(name, dir, "/home/me"),
     startRecording: path => {
       started.push(path);
@@ -653,6 +654,70 @@ test("recorder notices and passages share the history in time order", () => {
     "✓ second",
     "✗ 1 passage did not finish in time",
   ]);
+});
+
+const corgi_hint = '; set "corgi" in voice.json to the corgi your Corgi runs';
+/** The status line of a wide frame. */
+const statusLine = (ui: VoiceUi) => screen(ui.draw(200, 20), 200, 20)[9].trim();
+
+test("a local corgi that cannot talk to Corgi gets the voice.json hint in the status line (FR-011)", () => {
+  const { session, ui } = setup();
+  const reason = 'Corgi unreachable: JSON Parse error: Unexpected identifier "HTTP"';
+  session.link_state = "lost";
+  session.viewer = false;
+  session.reason = reason;
+  session.why = "unreachable";
+  session.source = "local";
+  expect(statusLine(ui)).toBe(`${reason}${corgi_hint}; retrying every second`);
+  // Output the local corgi does not understand gets it too.
+  session.link_state = "connected";
+  session.reason = "Corgi output not understood";
+  session.why = "not_understood";
+  expect(statusLine(ui)).toBe(`Corgi output not understood${corgi_hint}; nothing is typed until Corgi answers`);
+});
+
+test("no hint for a remote machine, a stopped Corgi or a missing viewer", () => {
+  const { session, ui } = setup();
+  session.link_state = "lost";
+  session.viewer = false;
+  session.why = "unreachable";
+  session.reason = 'marovo unreachable: JSON Parse error: Unexpected identifier "HTTP"';
+  session.source = "marovo";
+  expect(statusLine(ui)).toBe(`${session.reason}; retrying every second`);
+  session.reason = "Corgi unreachable: NoRuntime";
+  session.source = "local";
+  expect(statusLine(ui)).toBe("Corgi unreachable: NoRuntime; retrying every second");
+  session.link_state = "connected";
+  session.reason = "Corgi output not understood";
+  session.why = "not_understood";
+  session.source = "marovo";
+  expect(statusLine(ui)).toBe("Corgi output not understood; nothing is typed until Corgi answers");
+  session.reason = "no viewer attached";
+  session.why = "no_viewer";
+  session.source = null;
+  expect(statusLine(ui)).toBe("No Corgi window is attached; nothing is typed until one is");
+});
+
+test("the hint goes to the history once per distinct reason, not with every poll", () => {
+  const { session, ui, recorder } = recording();
+  session.link_state = "lost";
+  session.viewer = false;
+  session.why = "unreachable";
+  session.source = "local";
+  session.reason = 'Corgi unreachable: JSON Parse error: Unexpected identifier "HTTP"';
+  for (let i = 0; i < 3; i++) ui.draw(80, 20);
+  expect(recorder.notices.map(n => [n.kind, n.text])).toEqual([["error", `${session.reason}${corgi_hint}`]]);
+  session.reason = "Corgi unreachable: unknown command list; see corgi --help";
+  ui.draw(80, 20);
+  ui.draw(80, 20);
+  expect(recorder.notices.map(n => n.text)).toEqual([
+    `Corgi unreachable: JSON Parse error: Unexpected identifier "HTTP"${corgi_hint}`,
+    `Corgi unreachable: unknown command list; see corgi --help${corgi_hint}`,
+  ]);
+  // Reasons without the hint leave the history alone.
+  session.reason = "Corgi unreachable: NoRuntime";
+  ui.draw(80, 20);
+  expect(recorder.notices).toHaveLength(2);
 });
 
 test("while quitting waits for the transcript, the status line says so", () => {
@@ -785,43 +850,41 @@ test("a machine a viewer shows that stopped answering is named in the target and
   expect(rows[9]).toContain("marovo unreachable: RequestTimedOut; retrying every second");
 });
 
-/** Ctrl+A and Ctrl+K: empties the file name, suggestion and all. */
+/** Ctrl+A and Ctrl+K: empties the path field. */
 const clear = "\x01\x0b";
-/** The note under the file name, before a frame cuts it to fit: temp
- * folders can be longer than the prompt is wide. */
+/** The line under the path field, if any, before a frame cuts it to fit. */
 function hint(ui: VoiceUi): string | undefined {
-  return ui.prompt?.note().text;
+  return ui.prompt?.note()?.text;
 }
 /** The whole screen, wide enough for a temp folder's paths. */
 const wide = (ui: VoiceUi) => screen(ui.draw(200, 20), 200, 20).join("\n");
 
-test("r opens the file prompt for a name in the transcript folder, the caret after the date", () => {
+test("r opens the file prompt with the full path in the transcript folder, the caret after the date", () => {
   const { ui, folder, started } = recording();
   ui.input("r");
   const p = ui.prompt!;
-  expect(p.text).toMatch(/^\d{4}-\d\d-\d\d-\.txt$/);
-  expect(p.caret).toBe(p.text.length - ".txt".length);
+  expect(p.text).toMatch(new RegExp(`^${folder}/\\d{4}-\\d\\d-\\d\\d-\\.txt$`));
+  expect(p.caret).toBe([...p.text].length - ".txt".length);
   let rows = wide(ui);
   expect(rows).toContain("Record a transcript");
-  expect(rows).toContain("File name");
-  expect(rows).toContain(`Folder  ${folder}`);
-  expect(rows).toContain("enter record  esc cancel");
+  expect(rows).toContain(p.text);
+  expect(rows).not.toContain("Folder");
+  expect(rows).toContain("tab folders  enter record  esc cancel");
+  expect(hint(ui)).toBeUndefined();
   // The voice window hides the terminal's cursor, so the field draws its own caret.
   expect(ui.draw(80, 20)).toContain("\x1b[7m.");
   // Typing goes in between the date and the extension.
   ui.input("standupX\x7f");
-  const name = p.text;
-  expect(name).toMatch(/^\d{4}-\d\d-\d\d-standup\.txt$/);
-  expect(hint(ui)).toBe(join(folder, name));
+  expect(p.text).toMatch(/-standup\.txt$/);
   ui.input(clear);
   expect(p.text).toBe("");
   rows = screen(ui.draw(80, 20), 80, 20).join("\n");
   expect(rows).toContain("name is empty");
-  // Enter on a refused name does nothing; Esc cancels without a file.
+  // Enter on a refused path does nothing; Esc cancels without a file.
   ui.input("\r");
   expect(ui.prompt).not.toBeNull();
-  ui.input("../x.txt");
-  expect(screen(ui.draw(80, 20), 80, 20).join("\n")).toContain("may not leave the transcript folder");
+  ui.input(`${folder}/`);
+  expect(screen(ui.draw(80, 20), 80, 20).join("\n")).toContain("no file name after the last /");
   ui.input("\r");
   expect(ui.prompt).not.toBeNull();
   ui.input("\x1b");
@@ -829,7 +892,7 @@ test("r opens the file prompt for a name in the transcript folder, the caret aft
   expect(started).toEqual([]);
 });
 
-test("a sub-folder in the name is made for the user alone, and the next prompt opens in the transcript folder again", () => {
+test("a sub-folder in the path is made for the user alone, and a relative path resolves in the transcript folder", () => {
   const { ui, folder, started, recorder } = recording();
   ui.input("r");
   ui.input(clear + "calls/new/x.txt\r");
@@ -840,6 +903,67 @@ test("a sub-folder in the name is made for the user alone, and the next prompt o
   ui.input("r");
   ui.input(clear + "y.txt");
   expect(ui.prompt!.resolve()).toEqual({ path: join(folder, "y.txt") });
+  // `..` is resolved and allowed.
+  ui.input(clear + "../z.txt");
+  expect(ui.prompt!.resolve()).toEqual({ path: join(folder, "..", "z.txt") });
+});
+
+test("the next prompt starts in the folder the last started recording went to; a cancelled prompt changes nothing (FR-007a)", () => {
+  const { ui, folder, started, recorder } = recording();
+  mkdirSync(join(folder, "notes", "2026"), { recursive: true });
+  mkdirSync(join(folder, "meetings"));
+  // Tab, `no`, Enter puts notes/ in front of the name; Enter records there.
+  ui.input("r");
+  const name = ui.prompt!.text.slice(folder.length + 1);
+  ui.input("\t");
+  ui.input("no\r");
+  expect(ui.prompt!.text).toBe(`${folder}/notes/${name}`);
+  ui.input("\r");
+  expect(started).toEqual([join(folder, "notes", name)]);
+  void recorder.stop();
+  ui.input("r");
+  expect(ui.prompt!.text).toBe(`${folder}/notes/${name}`);
+  // Going up and cancelling does not move it.
+  ui.input("\x1b[D".repeat(4) + "\x1b[H" + "\x1b[C".repeat(folder.length + "/notes/".length) + "\x7f");
+  expect(ui.prompt!.text).toBe(`${folder}/${name}`);
+  ui.input("\x1b");
+  expect(ui.prompt).toBeNull();
+  ui.input("r");
+  expect(ui.prompt!.text).toBe(`${folder}/notes/${name}`);
+  ui.input("\x1b");
+  // A recording that does not start does not move it either.
+  const locked = join(folder, "locked");
+  mkdirSync(locked, { mode: 0o500 });
+  ui.input("r");
+  ui.input(clear + `${locked}/a.txt\r`);
+  if (process.getuid?.() !== 0) {
+    expect(recorder.current).toBeNull();
+    ui.input("r");
+    expect(ui.prompt!.text).toBe(`${folder}/notes/${name}`);
+    ui.input("\x1b");
+  } else void recorder.stop();
+  // A new run (a new window) starts from the transcript folder.
+  const again = recording({ folder });
+  again.ui.input("r");
+  expect(again.ui.prompt!.text).toBe(`${folder}/${name}`);
+});
+
+test("the prompt with its folder pop-down fits the smallest voice window", () => {
+  const { ui, folder } = recording();
+  for (let i = 0; i < 12; i++) mkdirSync(join(folder, `a-folder-with-a-rather-long-name-${i}`));
+  ui.input("r");
+  for (const keys of ["", "\t", "a-folder"]) {
+    ui.input(keys);
+    const rows = screen(ui.draw(37, 14), 37, 14),
+      text = rows.join("\n");
+    expect(rows).toHaveLength(14);
+    for (const r of rows) expect(Bun.stringWidth(r)).toBe(37);
+    expect(text).toContain("╭─ Record a transcript");
+    expect(text).toContain("╰");
+    expect(text).toContain(keys ? "↑↓ pick  enter take  esc close" : "⇥ folders  ↵ record  esc cancel");
+    if (keys) expect(text).toContain("more");
+    expect(text).not.toContain("Make this window bigger");
+  }
 });
 
 test("Enter starts the recording; the mode row shows REC and the footer the keys", () => {
@@ -864,7 +988,7 @@ test("Enter starts the recording; the mode row shows REC and the footer the keys
   expect(wide(ui)).toContain(`○ ${clock(0)} recording started: ${join(folder, "call.txt")}`);
 });
 
-test("the prompt takes a name in UTF-8, as the terminal sends it", () => {
+test("the prompt takes a path in UTF-8, as the terminal sends it", () => {
   const { ui, folder, started } = recording();
   ui.input("r");
   // Keys reach the window as latin1 bytes; a character may span two reads.
@@ -873,22 +997,23 @@ test("the prompt takes a name in UTF-8, as the terminal sends it", () => {
   ui.input(bytes.slice(0, 4));
   ui.input(bytes.slice(4));
   expect(ui.prompt?.text).toBe("café-日本.txt");
-  expect(hint(ui)).toBe(join(folder, "café-日本.txt"));
+  expect(ui.prompt!.resolve()).toEqual({ path: join(folder, "café-日本.txt") });
   ui.input("\r");
   expect(started).toEqual([join(folder, "café-日本.txt")]);
 });
 
-test("the prompt says when the name is an existing file it appends to", () => {
+test("the prompt says when the path is an existing file it appends to", () => {
   const { ui, folder } = recording();
   writeFileSync(join(folder, "notes.txt"), "Earlier.\n");
   ui.input("r");
   ui.input(clear + "notes.txt");
-  expect(hint(ui)).toBe(`appends to the existing file: ${join(folder, "notes.txt")}`);
-  expect(screen(ui.draw(100, 20), 100, 20).join("\n")).toContain("appends to the existing file: ");
+  expect(hint(ui)).toBe("appends to the existing file");
+  expect(screen(ui.draw(100, 20), 100, 20).join("\n")).toContain("appends to the existing file");
   ui.input("\x1b");
   ui.input("r");
   ui.input(clear + "~/x.txt");
-  expect(screen(ui.draw(80, 20), 80, 20).join("\n")).toContain("/home/me/x.txt");
+  expect(ui.prompt!.resolve()).toEqual({ path: "/home/me/x.txt" });
+  expect(hint(ui)).toBeUndefined();
 });
 
 test("R stops the recording, and quitting from the prompt makes no file", async () => {
@@ -911,9 +1036,11 @@ test("R stops the recording, and quitting from the prompt makes no file", async 
 
 test("a file that cannot be opened is reported in the status line and the history", () => {
   const { ui, folder } = recording();
-  writeFileSync(join(folder, "taken"), "");
+  // A folder the user may not write to: the prompt cannot know, opening fails.
+  mkdirSync(join(folder, "locked"), { mode: 0o500 });
+  if (process.getuid?.() === 0) return;
   ui.input("r");
-  ui.input(clear + "taken/x.txt\r");
+  ui.input(clear + "locked/x.txt\r");
   const rows = screen(ui.draw(120, 20), 120, 20);
   expect(rows[9]).toContain("Cannot write the transcript: ");
   expect(rows.join("\n")).toMatch(/✗ \d\d:\d\d:\d\d recording not started: /);

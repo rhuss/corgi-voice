@@ -143,6 +143,158 @@ test("stop resolves at once when every pending passage is released", async () =>
   expect(performance.now() - started).toBeLessThan(1000);
 });
 
+/** A recorder tracking one passage in progress whose speech ends at `end` ms
+ * so far. A cut ends it there, as the session does: its part so far is
+ * claimed (unless `short`, too little speech to send), and the rest is
+ * another utterance. `cuts` holds the recording's state at each cut. */
+function tracked() {
+  const made = setup(),
+    cuts: { state: string; open: boolean }[] = [];
+  let u: Utterance | null = passage(0, 0),
+    end: number | null = null,
+    short = false;
+  made.recorder.track(
+    () => u,
+    () => end,
+    () => {
+      const r = made.recorder.current!;
+      cuts.push({ state: r.state, open: r.spans.at(-1)!.to === null });
+      if (!u) return;
+      u.speech_end = end ?? 0;
+      if (!short) made.recorder.claim(u);
+      u = null;
+    },
+  );
+  return {
+    ...made,
+    cuts,
+    u: u!,
+    speechTo: (at: number | null) => (end = at),
+    tooShort: () => (short = true),
+  };
+}
+
+test("a stop cuts the passage in progress while its recording still runs, and waits for that part (FR-001)", async () => {
+  const { recorder, calls, lines, cuts, u, speechTo, tick } = tracked(),
+    path = join(folder(), "t.txt");
+  recorder.start(path);
+  tick(1000);
+  // Speech up to the stop itself: the boundary `claim` must still take.
+  speechTo(2000);
+  const stopping = recorder.stop()!;
+  expect(cuts).toEqual([{ state: "running", open: true }]);
+  expect(lines).toContain(`recording: cut utterance ${u.id} at the stop of ${path}`);
+  expect(u.record?.state).toBe("stopping");
+  // The dictation values are back at once, not once the passage is settled.
+  expect(calls).toEqual(["begin", "end"]);
+  tick(400);
+  expect(recorder.write(u, "Cut at the stop.")).toBe(true);
+  expect(await stopping).toEqual({ path, late: 0 });
+  expect(readFileSync(path, "utf8")).toBe("Cut at the stop.\n");
+  expect(lines.at(-1)).toBe(`recording: stopped ${path} waited_ms=400 late=0`);
+});
+
+test("a stop whose cut part has too little speech closes at once", async () => {
+  const { recorder, cuts, tooShort, speechTo, tick } = tracked(),
+    path = join(folder(), "t.txt");
+  recorder.start(path);
+  tick(1000);
+  speechTo(1950);
+  tooShort();
+  const started = performance.now();
+  expect(await recorder.stop()).toEqual({ path, late: 0 });
+  expect(cuts).toHaveLength(1);
+  expect(performance.now() - started).toBeLessThan(1000);
+});
+
+test("a stop with no passage in progress cuts nothing", async () => {
+  const { recorder, lines } = setup(),
+    path = join(folder(), "t.txt"),
+    cut: string[] = [];
+  recorder.track(
+    () => null,
+    () => null,
+    () => void cut.push("cut"),
+  );
+  recorder.start(path);
+  expect(await recorder.stop()).toEqual({ path, late: 0 });
+  expect(cut).toEqual([]);
+  expect(lines.some(l => l.includes("cut utterance"))).toBe(false);
+});
+
+test("a recording paused while a passage is held is not cut at its stop; the hold stays as at the pause", async () => {
+  const { recorder, calls, cuts, u, speechTo, tick } = tracked(),
+    path = join(folder(), "t.txt");
+  recorder.start(path);
+  tick(1000);
+  speechTo(1800);
+  recorder.pause();
+  const r = recorder.current!;
+  expect(u.record).toBe(r);
+  tick(500);
+  const stopping = recorder.stop()!;
+  // Nothing it would write is being spoken: no cut, and the values are back.
+  expect(cuts).toEqual([]);
+  expect(calls).toEqual(["begin", "end"]);
+  recorder.letGoIfContinued();
+  expect(u.record).toBe(r);
+  // Its speech goes on past the pause: let go, and the stop closes.
+  speechTo(2000);
+  recorder.letGoIfContinued();
+  expect(u.record).toBeNull();
+  expect(await stopping).toEqual({ path, late: 0 });
+});
+
+test("a pause lets go of a passage whose speech went past it, and a later stop does not wait for it", async () => {
+  const { recorder, u, speechTo, tick } = tracked(),
+    path = join(folder(), "t.txt");
+  recorder.start(path);
+  tick(1000);
+  speechTo(1900);
+  recorder.pause();
+  const r = recorder.current!;
+  recorder.letGoIfContinued();
+  expect(u.record).toBe(r);
+  tick(100);
+  speechTo(2050);
+  recorder.letGoIfContinued();
+  expect(u.record).toBeNull();
+  expect(r.pending.size).toBe(0);
+  const started = performance.now();
+  expect(await recorder.stop()).toEqual({ path, late: 0 });
+  expect(performance.now() - started).toBeLessThan(1000);
+  // Its end, after the pause, finds no recording.
+  u.speech_end = 2500;
+  recorder.claim(u);
+  expect(u.record).toBeNull();
+});
+
+test("a stop waits for the passages still being transcribed and the cut part, with the 10 s bound (FR-003)", async () => {
+  const { recorder, u, speechTo, tick } = tracked(),
+    path = join(folder(), "t.txt");
+  recorder.start(path);
+  const transcribing = passage(1100, 1500);
+  recorder.claim(transcribing);
+  tick(1000);
+  speechTo(1900);
+  const timers = spyOn(globalThis, "setTimeout");
+  let stopping: Promise<{ path: string; late: number }>, delays: unknown[];
+  try {
+    stopping = recorder.stop()!;
+    delays = timers.mock.calls.map(call => call[1]);
+  } finally {
+    timers.mockRestore();
+  }
+  expect(delays).toEqual([stop_wait_ms]);
+  expect(recorder.current).toBeNull();
+  expect(recorder.stopping.size).toBe(1);
+  expect(recorder.write(transcribing, "Still written.")).toBe(true);
+  expect(recorder.stopping.size).toBe(1);
+  expect(recorder.write(u, "Cut at the stop.")).toBe(true);
+  expect(await stopping).toEqual({ path, late: 0 });
+  expect(readFileSync(path, "utf8")).toBe("Still written.\nCut at the stop.\n");
+});
+
 test("an open failure starts nothing and leaves dictation timing alone", () => {
   const { recorder, calls } = setup(),
     dir = folder();

@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import { parseReply, paneLabel, resolve, type Machine } from "../../src/corgi/viewers";
-import { jsonFrom } from "../../src/corgi/poller";
+import { jsonFrom } from "../../src/corgi/errors";
 
 /** A `list --json` reply read as the poller reads it. */
 const readList = (text: string) => parseReply(jsonFrom(text));
@@ -129,22 +129,23 @@ test("step 2: no candidate says why, in words and as a cause", () => {
     target: null,
     reason: "no viewer attached",
     why: "no_viewer",
+    source: null,
   });
   expect(resolve([machine("local", [])], null, now).reason).toBe("no viewer attached");
   expect(
     resolve([machine("local", [], { state: "unreachable", error: "daemon not running", fetchedAt: 0 })], null, now),
-  ).toEqual({ target: null, reason: "Corgi unreachable: daemon not running", why: "unreachable" });
+  ).toEqual({ target: null, reason: "Corgi unreachable: daemon not running", why: "unreachable", source: "local" });
   expect(
     resolve([machine("local", [], { state: "not-understood", error: "Corgi output not understood" })], null, now),
-  ).toEqual({ target: null, reason: "Corgi output not understood", why: "not_understood" });
-  // A remote machine alone that is not understood, with no local answer.
+  ).toEqual({ target: null, reason: "Corgi output not understood", why: "not_understood", source: "local" });
+  // A remote machine alone that is not understood, with no local answer: its name is the source.
   expect(
-    resolve([machine("marovo", [], { state: "not-understood", error: "Corgi output not understood" })], null, now).why,
-  ).toBe("not_understood");
+    resolve([machine("marovo", [], { state: "not-understood", error: "Corgi output not understood" })], null, now),
+  ).toMatchObject({ why: "not_understood", source: "marovo" });
   expect(resolve([], null, now).reason).toStartWith("Corgi unreachable");
-  expect(resolve([], null, now).why).toBe("unreachable");
+  expect(resolve([], null, now)).toMatchObject({ why: "unreachable", source: null });
   // With a target there is neither.
-  expect(resolve([machine("local", [v(1, 10, 5)])], null, now)).toMatchObject({ reason: null, why: null });
+  expect(resolve([machine("local", [v(1, 10, 5)])], null, now)).toMatchObject({ reason: null, why: null, source: null });
 });
 
 test("step 3 and 4: one candidate, else the only watched one", () => {
@@ -206,6 +207,7 @@ test("a viewer showing a machine that stopped answering names that machine", () 
     target: null,
     reason: "marovo unreachable: RequestTimedOut",
     why: "unreachable",
+    source: "marovo",
   });
   // With no viewer at all, nobody is looking at marovo.
   expect(resolve([machine("local", []), marovo], null, now)).toMatchObject({
@@ -214,4 +216,21 @@ test("a viewer showing a machine that stopped answering names that machine", () 
   });
   // With every machine answering, a viewer without a pane is just not attached to any.
   expect(resolve([local, machine("marovo", [v(4, null, 2)])], null, now).reason).toBe("no viewer attached");
+});
+
+test("the source of a reason is the machine whose error it is (FR-011)", () => {
+  const misread = { state: "not-understood" as const, error: "Corgi output not understood" },
+    down = { state: "unreachable" as const, error: "JSON Parse error: Unexpected EOF", fetchedAt: 0 };
+  // The local machine's misreading comes first, whatever the others do.
+  expect(resolve([machine("marovo", [], misread), machine("local", [], misread)], null, now).source).toBe("local");
+  expect(resolve([machine("local", [], down), machine("marovo", [], misread)], null, now)).toMatchObject({
+    why: "not_understood",
+    source: "marovo",
+  });
+  // Corgi unreachable: the local machine's error when it failed, else the first failing one's.
+  expect(resolve([machine("marovo", [], down), machine("local", [], down)], null, now)).toMatchObject({
+    reason: "Corgi unreachable: JSON Parse error: Unexpected EOF",
+    source: "local",
+  });
+  expect(resolve([machine("marovo", [], down)], null, now)).toMatchObject({ why: "unreachable", source: "marovo" });
 });

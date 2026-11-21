@@ -2,6 +2,7 @@
 //! the threshold, what was heard and what became of it, and the keys.
 //! Drawn by corgi-voice's own screen layer (`screen.ts`), with the row order
 //! and labels of `corgi voice`.
+import { dirname } from "node:path";
 import * as palette from "./palette";
 import { Style } from "./palette";
 import * as level from "../voice/level";
@@ -18,6 +19,7 @@ import type { Timing } from "../voice/segmenter";
 import type { Recorder } from "../voice/recorder";
 import type { Tuning } from "../voice/tuning";
 import { Reading, clock, wrap } from "../voice/reading";
+import { isMismatch } from "../corgi/errors";
 
 const reset = "\x1b[0m",
   meter_cells = 20,
@@ -194,9 +196,11 @@ export type Options = {
   recorder?: Recorder;
   /** The values in effect, read for drawing instead of `threshold` and `timing`. */
   tuning?: Tuning;
-  /** The transcript folder relative names resolve against. */
+  /** The transcript folder relative paths resolve against. */
   folder?: string;
-  /** The file a typed transcript name in `folder` stands for, or why it is refused. */
+  /** The folder the prompt shows as `~/`; `$HOME` by default. */
+  home?: string;
+  /** The file a typed transcript path stands for, relative ones in `folder`, or why it is refused. */
   resolveName?: (name: string, folder: string) => { path: string } | { error: string };
   /** The clock a gauged threshold's glide runs on, in ms; `Date.now` by default. */
   now?: () => number;
@@ -229,6 +233,20 @@ export function problem(
       return null;
   }
 }
+/** Points a local `corgi` command that cannot talk to the running Corgi
+ * (another build) to the setting that fixes it (FR-011). */
+const corgi_hint = '; set "corgi" in voice.json to the corgi your Corgi runs';
+/** Whether the reason comes from the local machine's `corgi` failing in a way
+ * only a mismatched build does: an explicit mismatch pattern, or output
+ * without viewers. Remote machines' reasons never get the hint. */
+function mismatched(session: VoiceSession): boolean {
+  const reason = session.reason;
+  return session.source === "local" && !!reason && (session.why === "not_understood" || isMismatch(reason));
+}
+/** The session's reason, with the hint when it is a mismatched local corgi's. */
+function hinted(session: VoiceSession): string | null {
+  return mismatched(session) ? session.reason + corgi_hint : session.reason;
+}
 /** What stands between the window and Corgi, if anything (FR-008). */
 function linkStatus(session: VoiceSession): string | null {
   switch (session.link_state) {
@@ -236,7 +254,7 @@ function linkStatus(session: VoiceSession): string | null {
       return "Asking Corgi for its viewers…";
     case "lost":
       // The poller asks again every second by itself.
-      return `${session.reason ?? "Corgi unreachable"}; retrying every second`;
+      return `${hinted(session) ?? "Corgi unreachable"}; retrying every second`;
     default:
       return null;
   }
@@ -400,6 +418,8 @@ export class VoiceUi {
   help: { scroll: number } | null = null;
   /** The recording's file prompt, while open. */
   prompt: FilePrompt | null = null;
+  /** The folder of the last recording this run started; the next prompt opens there (FR-007a). */
+  private last_folder: string | null = null;
   /** Quitting waits for the transcript to be finished. */
   finishing = false;
   /** The reading view, while open: the first line it shows, or null while it
@@ -420,6 +440,8 @@ export class VoiceUi {
   /** The marker's glide to a gauged threshold, and the gauge rows already taken. */
   private glide: { from: number; to: number; started: number } | null = null;
   private gauges_seen: number;
+  /** The reasons whose voice.json hint went to the history already. */
+  private hinted = new Set<string>();
   private now: () => number;
   constructor(
     readonly session: VoiceSession,
@@ -432,7 +454,8 @@ export class VoiceUi {
     this.gauges_seen = session.gauges.length;
     this.now = opts.now ?? Date.now;
   }
-  /** A gauged threshold applies at once; the marker glides there. */
+  /** A gauged threshold applies at once; the marker glides there. A
+   * mismatched local corgi's hint is noted in the history. */
   private sync(): void {
     const gauges = this.session.gauges;
     for (const g of gauges.slice(this.gauges_seen))
@@ -441,6 +464,12 @@ export class VoiceUi {
         this.glide = { from: g.old, to: g.threshold, started: this.now() };
       }
     this.gauges_seen = gauges.length;
+    // The hint goes to the history once per reason, not with every poll.
+    const s = this.session;
+    if (mismatched(s) && !this.hinted.has(s.reason!)) {
+      this.hinted.add(s.reason!);
+      this.opts.recorder?.notice("error", s.reason + corgi_hint);
+    }
   }
   /** The glide's marker cell and the number `T:` counts through, a cell
    * every 50 ms; null once it is over. */
@@ -657,7 +686,7 @@ export class VoiceUi {
     if (error) return [warm, `Cannot write the transcript: ${error}`];
     if (!s.viewer)
       return s.reason && s.why !== null && s.why !== "no_viewer"
-        ? [warm, `${s.reason}; nothing is typed until Corgi answers`]
+        ? [warm, `${hinted(s)}; nothing is typed until Corgi answers`]
         : [muted, "No Corgi window is attached; nothing is typed until one is"];
     return null;
   }
@@ -673,15 +702,21 @@ export class VoiceUi {
         return recorder.resume();
       default: {
         if (!this.canStart) return;
-        const folder = this.opts.folder ?? process.cwd(),
-          resolveName = this.opts.resolveName!;
-        // Relative names always resolve against the transcript folder.
-        this.prompt = new FilePrompt({ folder, resolve: name => resolveName(name, folder) });
+        // The prompt opens where the last recording of this run went (FR-007a);
+        // relative paths resolve against the transcript folder.
+        const folder = this.opts.folder ?? process.cwd();
+        this.prompt = new FilePrompt({
+          folder,
+          start: this.last_folder ?? undefined,
+          home: this.opts.home,
+          resolve: this.opts.resolveName!,
+        });
       }
     }
   }
   /** A key for the file prompt: Enter records into the file it names, unless
-   * that is refused (its note says why); Esc cancels; Ctrl+C quits, making no file. */
+   * that is refused (its note says why); Esc cancels; Ctrl+C quits, making no
+   * file. Only a recording that started moves the next prompt's folder. */
   private promptKey(key: Key): void {
     const p = this.prompt!;
     switch (p.key(key)) {
@@ -696,7 +731,8 @@ export class VoiceUi {
         if ("error" in where) return;
         this.prompt = null;
         // An open error shows in the status line and the history.
-        this.opts.startRecording?.(where.path);
+        const started = this.opts.startRecording?.(where.path);
+        if (started && "path" in started) this.last_folder = dirname(started.path);
         return;
       }
     }

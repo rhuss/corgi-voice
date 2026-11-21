@@ -1,7 +1,8 @@
 //! `corgi-voice --setup`: takes over the in-Corgi voice mode's settings and
 //! models, checks the tools corgi-voice runs (whisper-server, ffmpeg and the
-//! `corgi` command with `pane send --stdin`), downloads the speech model and
-//! the speech filter, and says whether voice is ready.
+//! `corgi` command with `pane send --stdin`, and that it can talk to the
+//! running Corgi), downloads the speech model and the speech filter, and
+//! says whether voice is ready.
 import { createWriteStream, mkdirSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { pipeline } from "node:stream/promises";
 import { createHash } from "node:crypto";
@@ -12,7 +13,8 @@ import * as paths from "../util/paths";
 import * as subprocess from "../util/subprocess";
 import * as errors from "../util/errors";
 import { migrate } from "../util/migrate";
-import { resolveCorgi, checkCapabilities } from "../corgi/command";
+import { spaced } from "../util/text";
+import { resolveCorgi, checkCapabilities, checkReachable } from "../corgi/command";
 
 export type Tool = "whisper-server" | "ffmpeg";
 
@@ -103,6 +105,8 @@ export async function run(
     path?: string;
     /** Where the old and new files are, settings and models alike; `process.env` by default. */
     env?: NodeJS.ProcessEnv;
+    /** The bound of the `list --json` probe, in ms; 3000 by default. */
+    reachMs?: number;
   } = {},
 ): Promise<number> {
   const write = deps.write ?? (text => void process.stdout.write(text)),
@@ -130,16 +134,37 @@ export async function run(
     ready = false;
     write(`[missing] ffmpeg: install with ${hint("ffmpeg")}\n`);
   }
-  const corgi = resolveCorgi({ setting: corgiCmd }, { ...env, PATH: path });
+  const corgi = resolveCorgi({ setting: corgiCmd }, { ...env, PATH: path }),
+    // The path and corgi's own error text may hold control characters: they
+    // show as spaces, as everywhere on screen.
+    say = (line: string) => write(spaced(line) + "\n");
   if (!corgi.ok) {
     ready = false;
-    write(`[missing] corgi: ${corgi.error}\n`);
+    say(`[missing] corgi: ${corgi.error}`);
   } else {
     const able = await checkCapabilities(corgi.cmd);
-    if (able.ok) write(`[ok] corgi ${corgi.cmd}\n`);
-    else {
+    if (!able.ok) {
       ready = false;
-      write(`[too old] corgi: ${able.error}\n`);
+      say(`[too old] corgi: ${able.error}`);
+    } else {
+      // A corgi of another build than the running Corgi has --stdin too, and
+      // still cannot talk to it (FR-008, FR-009).
+      const reach = await checkReachable(corgi.cmd, deps.reachMs);
+      switch (reach.kind) {
+        case "ok":
+          say(`[ok] corgi ${corgi.cmd}`);
+          break;
+        case "not_running":
+          say(`[note] corgi: Corgi is not running; could not check that ${corgi.cmd} talks to it`);
+          break;
+        case "no_answer":
+          say("[note] corgi: no answer in time");
+          break;
+        case "mismatch":
+          ready = false;
+          say(`[mismatch] corgi ${corgi.cmd} cannot talk to the running Corgi: ${reach.detail}`);
+          say(`         set "corgi" in voice.json, or pass --corgi, to the corgi your Corgi runs`);
+      }
     }
   }
   for (const [label, entry] of [

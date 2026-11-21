@@ -142,6 +142,8 @@ export class VoiceSession {
   machine: string | null = null;
   reason: string | null = null;
   why: Seen["why"] = null;
+  /** The machine whose error forms `reason`, if one does. */
+  source: string | null = null;
   /** A gauge listening to the background: what it heard, the loudest level
    * so far, and how far it is, 0 to 1. */
   gauge: { frames: Int16Array[]; loudest: number; progress: number } | null = null;
@@ -171,10 +173,12 @@ export class VoiceSession {
     },
   ) {
     deps.transcriber.on("crashed", () => this.crashed());
-    // A pause or stop keeps the passage being spoken for its recording (FR-004a).
+    // A pause keeps the passage being spoken for its recording (FR-004a); a
+    // stop cuts it (FR-001).
     deps.recorder?.track(
       () => this.current,
       () => this.deps.segmenter.speechEnd,
+      () => this.cut(),
     );
   }
   get available(): boolean {
@@ -210,6 +214,10 @@ export class VoiceSession {
     if (this.mic) this.setAvailable(true, null);
     // A gauge needs only the microphone: mute, the viewer, Corgi and the server don't stop it.
     if (this.gauge) return this.listen(f);
+    // The rest of a passage a stop cut (`cut`) gets its row here, once the
+    // stop has given dictation its mute back: it is typed or dropped as any
+    // utterance outside a recording.
+    if (this.deps.segmenter.recording && !this.current) this.begun();
     // A running recording keeps listening while muted or without a viewer.
     if (!this.available || (!this.recordingRuns && (this.muted || !this.viewer))) {
       // The recording paused or stopped in the middle of a muted passage.
@@ -226,20 +234,39 @@ export class VoiceSession {
     const done = this.deps.segmenter.push(f);
     this.pause = this.deps.segmenter.pause;
     for (const segment of done) this.segmented(segment);
-    if (this.deps.segmenter.recording && !this.current) {
-      this.current = this.utterance("recording");
-      // Speech that began muted or without a viewer stays untyped, even if
-      // that changes before it ends: only a recording was listening.
-      if (this.muted) this.untype(this.current, "muted");
-      else if (!this.viewer) this.untype(this.current, "no_viewer");
-      this.changed();
-    } else if (!this.deps.segmenter.recording && this.current) {
-      // Too little speech to count.
-      this.current.status = "dropped";
-      this.current.reason = "too short";
-      this.letGo();
-      this.changed();
-    }
+    if (this.deps.segmenter.recording && !this.current) this.begun();
+    else if (!this.deps.segmenter.recording && this.current) this.tooShort();
+    // A pause holding the passage in progress lets go of it once its speech
+    // goes on past the pause. Only now: a cut at the cap has given the held
+    // passage its end above, and `speechEnd` is its continuation's.
+    if (this.current) this.deps.recorder?.letGoIfContinued();
+  }
+  /** The segmenter began an utterance, or carries one on past a cut: it gets its row. */
+  private begun(): void {
+    this.current = this.utterance("recording");
+    // Speech that began muted or without a viewer stays untyped, even if
+    // that changes before it ends: only a recording was listening.
+    if (this.muted) this.untype(this.current, "muted");
+    else if (!this.viewer) this.untype(this.current, "no_viewer");
+    this.changed();
+  }
+  /** The utterance in progress ended with too little speech to count. */
+  private tooShort(): void {
+    this.current!.status = "dropped";
+    this.current!.reason = "too short";
+    this.letGo();
+    this.changed();
+  }
+  /** A running recording stops: the passage in progress is cut there, as the
+   * cap cuts it, and its part so far ends now, while the recording still
+   * runs, so `claim` gives it to that recording. A part with too little
+   * speech is dropped as any such utterance is. The segmenter carries on with
+   * the rest, which gets its own row on the next frame. */
+  private cut(): void {
+    const done = this.deps.segmenter.cut();
+    for (const segment of done) this.segmented(segment);
+    if (!done.length && this.current) this.tooShort();
+    this.pause = this.deps.segmenter.pause;
   }
   /** Gauges the threshold against the background, or says why it cannot:
    * the microphone, or a recording (which has a threshold of its own). What
@@ -384,7 +411,7 @@ export class VoiceSession {
     return this.why !== null && this.why !== "no_viewer" ? this.reason : null;
   }
   /** A recording is running, or holds the passage being spoken since it
-   * paused or stopped, so speech is heard even when it cannot be typed. */
+   * paused, so speech is heard even when it cannot be typed. */
   private get recordingRuns(): boolean {
     return this.deps.recorder?.current?.state === "running" || !!this.current?.record;
   }
@@ -479,7 +506,7 @@ export class VoiceSession {
       `utterance ${u.id}: ${status}${why ? ` (${why})` : ""} duration=${shown(u.duration)}` +
         (t.transcribe_ms !== undefined ? ` transcribe_ms=${t.transcribe_ms}` : "") +
         (t.deliver_ms !== undefined ? ` deliver_ms=${t.deliver_ms}` : "") +
-        // One cut at the cap went out whole, with no post-roll applied.
+        // One cut at the cap, or at a recording's stop, went out whole, with no post-roll applied.
         (cut ? (cut.capped ? " capped" : ` post_roll=${shown(cut.post_roll)}`) : "") +
         (cut ? ` kept=${shown(cut.kept)} dropped=${shown(cut.dropped)}` : "") +
         (u.pad !== undefined ? ` pad=${shown(u.pad)}` : "") +
@@ -510,6 +537,7 @@ export class VoiceSession {
       this.machine === state.machine &&
       this.reason === state.reason &&
       this.why === state.why &&
+      this.source === (state.source ?? null) &&
       this.link_state === link_state
     )
       return;
@@ -518,6 +546,7 @@ export class VoiceSession {
     // The reason first: what is dropped now names it (a machine that stopped answering, say).
     this.reason = state.reason;
     this.why = state.why;
+    this.source = state.source ?? null;
     if (this.viewer && !state.viewer) this.discard("discarded", this.named() ?? no_viewer, "no_viewer");
     this.viewer = state.viewer;
     this.focus = state.focus;

@@ -38,7 +38,11 @@ export type Target = {
  * the same in words, for the window and the history. "unreachable" covers
  * Corgi as a whole and the one machine a viewer shows. */
 export type Why = "no_viewer" | "unreachable" | "not_understood";
-export type Resolution = { target: Target; reason: null; why: null } | { target: null; reason: string; why: Why };
+/** `source` is the machine whose error forms the reason, if one does: the
+ * window points a mismatched local `corgi` command out (FR-011). */
+export type Resolution =
+  | { target: Target; reason: null; why: null; source: null }
+  | { target: null; reason: string; why: Why; source: string | null };
 export type Parsed = { ok: true; viewers: Viewer[]; panes: Map<number, PaneInfo> } | { ok: false; reason: "not-understood" };
 
 /** How old a machine's data may be and still choose a target. */
@@ -155,15 +159,16 @@ export function resolve(machines: Machine[], previous: string | null, now: numbe
     },
     reason: null,
     why: null,
+    source: null,
   };
 }
 /** Why there is no target: Corgi's output not understood; a machine that
  * stopped answering while a viewer seems to show it; no viewer; or Corgi
- * unreachable. */
-function whyNone(machines: Machine[], now: number): { reason: string; why: Why } {
-  const misread = { reason: not_understood, why: "not_understood" } as const,
+ * unreachable; and the machine whose error that is, if any. */
+function whyNone(machines: Machine[], now: number): { reason: string; why: Why; source: string | null } {
+  const misread = (m: Machine) => ({ reason: not_understood, why: "not_understood", source: m.name }) as const,
     local = machines.find(m => m.name === "local");
-  if (local?.state === "not-understood") return misread;
+  if (local?.state === "not-understood") return misread(local);
   const fresh = machines.filter(m => isFresh(m, now));
   if (fresh.length) {
     // A viewer without a focused pane on any machine that answers shows
@@ -173,10 +178,19 @@ function whyNone(machines: Machine[], now: number): { reason: string; why: Why }
       // The one whose last answer had a focused viewer is the likeliest.
       likely = down.find(m => m.viewers.some(v => v.pane !== null)) ?? down[0];
     if (elsewhere && likely)
-      return { reason: `${likely.name} unreachable: ${likely.error ?? "no answer in time"}`, why: "unreachable" };
-    return { reason: no_viewer, why: "no_viewer" };
+      return {
+        reason: `${likely.name} unreachable: ${likely.error ?? "no answer in time"}`,
+        why: "unreachable",
+        source: likely.name,
+      };
+    return { reason: no_viewer, why: "no_viewer", source: null };
   }
-  if (machines.some(m => m.state === "not-understood")) return misread;
+  const misreading = machines.find(m => m.state === "not-understood");
+  if (misreading) return misread(misreading);
   const failed = (local?.state === "unreachable" ? local : null) ?? machines.find(m => m.error);
-  return { reason: `Corgi unreachable: ${failed?.error ?? "no answer in time"}`, why: "unreachable" };
+  return {
+    reason: `Corgi unreachable: ${failed?.error ?? "no answer in time"}`,
+    why: "unreachable",
+    source: failed?.name ?? null,
+  };
 }

@@ -488,6 +488,7 @@ async function voice(
     recorder,
     tuning,
     folder,
+    home,
     resolveName,
     startRecording: path => recorder.start(path),
     stopRecording: () => void recorder.stop(),

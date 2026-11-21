@@ -2,7 +2,7 @@ import { test, expect, afterEach } from "bun:test";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { resolveCorgi, checkCapabilities } from "../../src/corgi/command";
+import { resolveCorgi, checkCapabilities, checkReachable, reach_ms } from "../../src/corgi/command";
 import { fakeCorgi, type FakeCorgi } from "../fixtures/corgi";
 
 const dirs: string[] = [],
@@ -107,3 +107,81 @@ test("the help call is bounded at 3000 ms", async () => {
   expect(took).toBeGreaterThanOrEqual(2900);
   expect(took).toBeLessThan(4000);
 }, 8000);
+
+test("a corgi whose list --json has viewers, none included, reaches Corgi", async () => {
+  const fake = fakeCorgi({ machines: { local: { stdout: '{"viewers":[]}' } } });
+  fakes.push(fake);
+  expect(await checkReachable(fake.cmd)).toEqual({ kind: "ok" });
+  // One call, list --json and nothing else: no pane is touched.
+  expect(fake.calls().map(c => c.argv)).toEqual([["list", "--json"]]);
+});
+
+test("a stopped Corgi is not running, from the reply's err or from stderr", async () => {
+  const fake = fakeCorgi({ machines: { local: { stdout: '{"ok":false,"err":"NoRuntime"}', code: 1 } } });
+  fakes.push(fake);
+  expect(await checkReachable(fake.cmd)).toEqual({ kind: "not_running", detail: "NoRuntime" });
+  fake.set({ machines: { local: { stderr: "corgi: ConnectionRefused\n", code: 1 } } });
+  expect(await checkReachable(fake.cmd)).toEqual({ kind: "not_running", detail: "ConnectionRefused" });
+});
+
+test("the walkthrough's old corgi against a newer Corgi is a mismatch with its error", async () => {
+  const fake = fakeCorgi({
+    machines: { local: { stdout: '{"ok":false,"err":"JSON Parse error: Unexpected identifier \\"HTTP\\""}', code: 1 } },
+  });
+  fakes.push(fake);
+  expect(await checkReachable(fake.cmd)).toEqual({
+    kind: "mismatch",
+    detail: 'JSON Parse error: Unexpected identifier "HTTP"',
+  });
+  // An err with exit code 0 is read the same.
+  fake.set({ machines: { local: { stdout: '{"ok":false,"err":"JSON Parse error: Unexpected EOF"}' } } });
+  expect(await checkReachable(fake.cmd)).toEqual({ kind: "mismatch", detail: "JSON Parse error: Unexpected EOF" });
+  // What the old release really does: the reply on standard error, exit 2.
+  fake.set({
+    machines: {
+      local: { stderr: '{"ok":false,"err":"JSON Parse error: Unexpected identifier \\"HTTP\\""}\n', code: 2 },
+    },
+  });
+  expect(await checkReachable(fake.cmd)).toEqual({
+    kind: "mismatch",
+    detail: 'JSON Parse error: Unexpected identifier "HTTP"',
+  });
+  fake.set({ machines: { local: { stderr: "corgi: unknown command list; see corgi --help\n", code: 2 } } });
+  expect(await checkReachable(fake.cmd)).toEqual({
+    kind: "mismatch",
+    detail: "unknown command list; see corgi --help",
+  });
+  // Only the first line of the error is quoted (FR-009).
+  fake.set({ machines: { local: { stderr: "corgi: unknown command list\nusage: corgi <command>\n", code: 2 } } });
+  expect(await checkReachable(fake.cmd)).toEqual({ kind: "mismatch", detail: "unknown command list" });
+  // An answer that is no JSON at all, with exit code 0.
+  fake.set({ machines: { local: { stdout: "HTTP/1.1 400 Bad Request\n" } } });
+  expect(await checkReachable(fake.cmd)).toEqual({ kind: "mismatch", detail: "Corgi output not understood" });
+});
+
+test("a reply without viewers is a mismatch: Corgi output not understood", async () => {
+  const fake = fakeCorgi({ machines: { local: { stdout: '{"panes":[]}' } } });
+  fakes.push(fake);
+  expect(await checkReachable(fake.cmd)).toEqual({ kind: "mismatch", detail: "Corgi output not understood" });
+});
+
+test("a slow Corgi has no answer in time: past the bound, or RequestTimedOut", async () => {
+  const fake = fakeCorgi({ machines: { local: { stdout: '{"viewers":[]}', delayMs: 2000 } } });
+  fakes.push(fake);
+  const started = Date.now();
+  expect(await checkReachable(fake.cmd, 200)).toEqual({ kind: "no_answer", detail: "no answer in time" });
+  expect(Date.now() - started).toBeLessThan(1500);
+  fake.set({ machines: { local: { stderr: "corgi: RequestTimedOut\n", code: 1 } } });
+  expect(await checkReachable(fake.cmd)).toEqual({ kind: "no_answer", detail: "RequestTimedOut" });
+});
+
+test("the probe is bounded at 3 s by default", () => {
+  expect(reach_ms).toBe(3000);
+});
+
+test("a corgi that vanished before the probe is a mismatch saying it was not found", async () => {
+  expect(await checkReachable("/nonexistent/corgi")).toEqual({
+    kind: "mismatch",
+    detail: "corgi not found: /nonexistent/corgi",
+  });
+});

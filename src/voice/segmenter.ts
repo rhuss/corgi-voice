@@ -4,11 +4,12 @@ import * as level from "./level";
 
 /** An utterance. Times are ms on the `now()` clock, counted in frames from the
  * utterance's first frame:
- * - `speech_start`: the first loud frame, without pre-roll; after a cut at the
- *   cap, the first frame after the cut;
+ * - `speech_start`: the first loud frame, without pre-roll; after a cut (at
+ *   the cap or a stop), the first frame after the cut;
  * - `speech_end`: the end of the last loud frame, without the quiet after it;
- * - `capped`: cut at the cap, so the next segment carries on the same speech;
- * - `cut_at`: where the cap cut it, which is the next segment's `speech_start`;
+ * - `capped`: cut at the cap (or by `cut()`, at a recording's stop), so the
+ *   next segment carries on the same speech;
+ * - `cut_at`: where it was cut, which is the next segment's `speech_start`;
  * - `continues`: starts at such a cut, carrying on the previous segment.
  * And what the cut kept, in seconds: `post_roll` is the one in effect as it
  * ended, in whole frames up to the silence window, which also sets the speech
@@ -177,17 +178,28 @@ export class Segmenter {
       this.active = false;
       return done;
     }
-    if (this.frames.length >= this.cap_frames) {
-      // A long utterance goes out at the cap, untrimmed; listening carries straight on.
-      const taken = this.frames.length,
-        done = this.take(this.tail, 0, true);
-      this.started_at = this.now();
-      this.origin += taken * frame_ms;
-      this.lead = 0;
-      this.continued = true;
-      return done;
-    }
+    // A long utterance goes out at the cap.
+    if (this.frames.length >= this.cap_frames) return this.split();
     return [];
+  }
+  /** Cuts the utterance in progress here, as the cap does: what it holds so
+   * far goes out untrimmed, its quiet so far included (nothing when it has
+   * too little speech), and the rest carries on as its continuation. A
+   * recording's stop cuts the passage it falls in, so the part before the
+   * stop is written without waiting to learn where the speech ends. */
+  cut(): Segment[] {
+    return this.active ? this.split() : [];
+  }
+  /** The utterance so far goes out whole; listening carries straight on, the
+   * next frames counted from the cut. */
+  private split(): Segment[] {
+    const taken = this.frames.length,
+      done = this.take(this.tail, 0, true);
+    this.started_at = this.now();
+    this.origin += taken * frame_ms;
+    this.lead = 0;
+    this.continued = true;
+    return done;
   }
   /** Drops the utterance in progress. */
   abort(): void {

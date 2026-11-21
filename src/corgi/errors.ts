@@ -22,6 +22,50 @@ export const ssh_patterns: RegExp[] = [
   /Host key verification failed/,
   /sign_and_send_pubkey/,
 ];
+/** What a failed `list --json` says about the `corgi` command (FR-008, FR-010):
+ * Corgi is not running, did not answer in time, or this build of `corgi`
+ * cannot talk to the Corgi that runs. */
+export type Reach = "not_running" | "no_answer" | "mismatch";
+/** The patterns of each class. Setup counts anything none of them matches as
+ * a mismatch; the window hints only on the explicit `mismatch` ones, so a
+ * passing error never sends the user to voice.json. */
+export const reach_patterns: Record<Reach, RegExp[]> = {
+  not_running: [/\bNoRuntime\b/, /\bConnectionRefused\b/, /\bECONNREFUSED\b/],
+  no_answer: [/\bRequestTimedOut\b/],
+  mismatch: [/JSON Parse error/, /\bunknown command\b/, /\bUnexpected\b/],
+};
+/** The class of the error `text` of a `list --json` call; unmatched text is
+ * a mismatch. A call our own bound ended is no answer, decided by the caller. */
+export function classify(text: string): Reach {
+  for (const kind of ["not_running", "no_answer"] as const)
+    if (reach_patterns[kind].some(p => p.test(text))) return kind;
+  return "mismatch";
+}
+/** Whether `reason` names one of the explicit mismatch patterns. */
+export function isMismatch(reason: string): boolean {
+  return reach_patterns.mismatch.some(p => p.test(reason));
+}
+/** The JSON object in `text` from its first `{`, past any notice before it, or null. */
+export function jsonFrom(text: string): unknown {
+  const at = text.indexOf("{");
+  if (at < 0) return null;
+  try {
+    return JSON.parse(text.slice(at));
+  } catch {
+    return null;
+  }
+}
+/** The `err` of a reply with `ok: false`, if that is what `reply` is. */
+export function refused(reply: unknown): string | null {
+  const r = reply && typeof reply === "object" ? (reply as Record<string, unknown>) : null;
+  return r && r.ok === false && typeof r.err === "string" ? r.err : null;
+}
+/** The `err` of an `{"ok":false}` reply a failed call printed, on standard
+ * output or, as older corgi releases do, on standard error; null when neither
+ * holds one. */
+export function refusal(stdout: string, stderr: string): string | null {
+  return refused(jsonFrom(stdout)) ?? refused(jsonFrom(stderr));
+}
 /** A delivery abandoned at its bound: the text may have arrived. */
 export const no_answer = "no answer in time; may have been typed";
 /** The longest reason taken from corgi's own output, in columns. */

@@ -12,22 +12,41 @@ export function defaultName(now: Date): { name: string; caret: number } {
   return { name, caret: name.length - ".txt".length };
 }
 
-/** The file a typed name stands for: `~/` is the home folder, absolute names
- * are used as given, and relative names stay inside `folder`, the transcript folder. */
+/** The file a typed path stands for: `~/` is the home folder, absolute paths
+ * are used as given, and relative ones resolve against `folder`, the
+ * transcript folder; `..` parts are resolved, and may lead anywhere. A path
+ * without a file name after its last `/` is refused. */
 export function resolve(name: string, folder: string, home: string): { path: string } | { error: string } {
   const trimmed = name.trim();
   if (!trimmed) return { error: "name is empty" };
+  const file = trimmed.slice(trimmed.lastIndexOf("/") + 1);
+  if (!file || file === "." || file === "..") return { error: "no file name after the last /" };
   if (trimmed.startsWith("~/")) return { path: path.join(home, trimmed.slice(2)) };
   if (path.isAbsolute(trimmed)) return { path: path.normalize(trimmed) };
-  const joined = path.join(folder, trimmed);
-  const inside = path.relative(folder, joined);
-  if (inside === ".." || inside.startsWith(".." + path.sep) || path.isAbsolute(inside))
-    return { error: "the name may not leave the transcript folder with .." };
-  return { path: joined };
+  return { path: path.join(folder, trimmed) };
 }
 
-export function exists(file: string): boolean {
-  return fs.existsSync(file);
+/** What is at `file`: a file (anything but a folder), a folder (links
+ * followed), or nothing. */
+export type Kind = "file" | "folder" | "missing";
+export function kind(file: string): Kind {
+  try {
+    return fs.statSync(file).isDirectory() ? "folder" : "file";
+  } catch {
+    return "missing";
+  }
+}
+
+/** Why a recording cannot go to `file`, or null: it is a folder, or a folder
+ * on its way is a file. Only reads. */
+export function refusal(file: string, at: (file: string) => Kind = kind): string | null {
+  if (at(file) === "folder") return "this is a folder, not a file";
+  for (let dir = path.dirname(file); ; dir = path.dirname(dir)) {
+    const found = at(dir);
+    if (found === "folder") return null;
+    if (found === "file") return `${path.basename(dir)} is a file, not a folder`;
+    if (path.dirname(dir) === dir) return null;
+  }
 }
 
 /** An open transcript, appended to one passage per line and synced after each. */

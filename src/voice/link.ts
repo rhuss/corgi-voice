@@ -13,6 +13,8 @@ export type Seen = {
   machine: string | null;
   reason: string | null;
   why: Why | null;
+  /** The machine whose error forms `reason`, if one does; left out, none. */
+  source?: string | null;
 };
 /** Where a delivery went. */
 export type Typed = { machine: string; pane: number; viewer: number };

@@ -33,8 +33,8 @@ const max_said = 120;
 /** What the window shows for a resolution. */
 export function seen(r: Resolution): Seen {
   return r.target
-    ? { viewer: true, focus: r.target.label, machine: r.target.machine, reason: null, why: null }
-    : { viewer: false, focus: null, machine: null, reason: r.reason, why: r.why };
+    ? { viewer: true, focus: r.target.label, machine: r.target.machine, reason: null, why: null, source: null }
+    : { viewer: false, focus: null, machine: null, reason: r.reason, why: r.why, source: r.source };
 }
 
 export class CorgiLink implements VoiceLink {

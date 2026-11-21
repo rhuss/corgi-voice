@@ -86,35 +86,53 @@ test("close twice is harmless and writes after close throw", () => {
   expect(() => out.write("late", true)).toThrow();
 });
 
-test("resolve keeps relative names inside the folder", () => {
+test("resolve puts relative paths in the transcript folder; .. parts are resolved and may leave it", () => {
   const folder = path.join(dir, "transcripts");
   expect(transcript.resolve("  call.txt  ", folder, "/home/me")).toEqual({ path: path.join(folder, "call.txt") });
   expect(transcript.resolve("notes", folder, "/home/me")).toEqual({ path: path.join(folder, "notes") });
   expect(transcript.resolve("a/b/c.txt", folder, "/home/me")).toEqual({ path: path.join(folder, "a", "b", "c.txt") });
   expect(transcript.resolve("a/../b.txt", folder, "/home/me")).toEqual({ path: path.join(folder, "b.txt") });
   expect(transcript.resolve("..notes.txt", folder, "/home/me")).toEqual({ path: path.join(folder, "..notes.txt") });
-  const refused = { error: "the name may not leave the transcript folder with .." };
-  expect(transcript.resolve("../x.txt", folder, "/home/me")).toEqual(refused);
-  expect(transcript.resolve("a/../../x.txt", folder, "/home/me")).toEqual(refused);
-  expect(transcript.resolve("..", folder, "/home/me")).toEqual(refused);
+  // Spec 001 FR-021's refusal is lifted: any folder may be chosen (002 revision notes).
+  expect(transcript.resolve("../x.txt", folder, "/home/me")).toEqual({ path: path.join(dir, "x.txt") });
+  expect(transcript.resolve("a/../../x.txt", folder, "/home/me")).toEqual({ path: path.join(dir, "x.txt") });
+  expect(transcript.resolve("~/../other/x.txt", folder, "/home/me")).toEqual({ path: "/home/other/x.txt" });
 });
 
-test("resolve uses home and absolute names as given", () => {
+test("resolve uses home and absolute paths as given", () => {
   expect(transcript.resolve("~/calls/x.txt", "/data", "/home/me")).toEqual({ path: "/home/me/calls/x.txt" });
   expect(transcript.resolve("/tmp/x.txt", "/data", "/home/me")).toEqual({ path: "/tmp/x.txt" });
   expect(transcript.resolve("/tmp/a/../x.txt", "/data", "/home/me")).toEqual({ path: "/tmp/x.txt" });
 });
 
-test("resolve refuses empty names", () => {
+test("resolve refuses empty names and paths without a file name", () => {
   expect(transcript.resolve("", "/data", "/home/me")).toEqual({ error: "name is empty" });
   expect(transcript.resolve("   ", "/data", "/home/me")).toEqual({ error: "name is empty" });
+  const none = { error: "no file name after the last /" };
+  for (const name of ["~/notes/", "/tmp/", "/", "a/..", "..", "~/.", "notes/  "])
+    expect(transcript.resolve(name, "/data", "/home/me")).toEqual(none);
 });
 
-test("exists reports existing files", () => {
+test("kind tells files, folders, links to folders and missing paths apart", () => {
   const file = path.join(dir, "t.txt");
-  expect(transcript.exists(file)).toBe(false);
+  expect(transcript.kind(file)).toBe("missing");
   fs.writeFileSync(file, "x");
-  expect(transcript.exists(file)).toBe(true);
+  expect(transcript.kind(file)).toBe("file");
+  expect(transcript.kind(dir)).toBe("folder");
+  fs.symlinkSync(dir, path.join(dir, "link"));
+  expect(transcript.kind(path.join(dir, "link"))).toBe("folder");
+});
+
+test("refusal names a folder in place of the file and a file on the way; missing folders are fine", () => {
+  fs.writeFileSync(path.join(dir, "old.txt"), "x");
+  fs.mkdirSync(path.join(dir, "notes"));
+  expect(transcript.refusal(path.join(dir, "notes"))).toBe("this is a folder, not a file");
+  expect(transcript.refusal(path.join(dir, "old.txt", "x.txt"))).toBe("old.txt is a file, not a folder");
+  expect(transcript.refusal(path.join(dir, "old.txt", "a", "b", "x.txt"))).toBe("old.txt is a file, not a folder");
+  expect(transcript.refusal(path.join(dir, "old.txt"))).toBeNull();
+  expect(transcript.refusal(path.join(dir, "new", "deeper", "x.txt"))).toBeNull();
+  // Only reads: nothing was made.
+  expect(fs.existsSync(path.join(dir, "new"))).toBe(false);
 });
 
 test("the default name is the local date, zero padded, with the caret before the extension", () => {

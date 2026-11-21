@@ -1,14 +1,15 @@
-import { test, expect, afterEach } from "bun:test";
+import { test, expect, afterEach, spyOn } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { VoiceSession, max_queued, safety_ms } from "../../src/voice/session";
 import { Segmenter } from "../../src/voice/segmenter";
-import { Recorder } from "../../src/voice/recorder";
+import { Recorder, stop_wait_ms } from "../../src/voice/recorder";
 import { Events, deadline_ms, type Seen, type VoiceLink } from "../../src/voice/link";
-import type { Tuning } from "../../src/voice/tuning";
+import { Tuning as RealTuning, type Tuning } from "../../src/voice/tuning";
 import { shapes, concat, music, silence, tone } from "../fixtures/voice/make_pcm";
 import * as level from "../../src/voice/level";
+import { muteWhileRecording } from "../../src/main";
 
 /** What the link reports: a viewer on `focus`, or none attached. */
 const seen = (viewer: boolean, focus: string | null): Seen => ({
@@ -639,26 +640,45 @@ test("a recorded passage whose typing gets no answer may have been typed", async
   expect(transcript(path)).toBe("slow to answer\n");
 });
 
-test("muted, a passage cut off by a pause or a stop is dropped, unheard and unwritten", async () => {
-  for (const end_recording of ["pause", "stop"] as const) {
-    const { recorder: r, path } = recorder(),
-      { s, whisper, link } = session(["private"], { recorder: r });
-    await s.start();
-    r.start(path);
-    s.setMuted(true);
-    const pcm = shapes.speech();
-    begin(s, pcm);
-    expect(s.recording).toBe(true);
-    if (end_recording === "pause") r.pause();
-    else void r.stop();
-    end(s, pcm);
-    await Bun.sleep(30);
-    expect(statuses(s)).toEqual([["muted", null]]);
-    expect(s.recording).toBe(false);
-    expect(whisper.requests).toBe(0);
-    expect(link.calls).toEqual([]);
-    expect(transcript(path)).toBe("");
-  }
+test("muted, a passage cut off by a pause is dropped, unheard and unwritten", async () => {
+  const { recorder: r, path } = recorder(),
+    { s, whisper, link } = session(["private"], { recorder: r });
+  await s.start();
+  r.start(path);
+  s.setMuted(true);
+  const pcm = shapes.speech();
+  begin(s, pcm);
+  expect(s.recording).toBe(true);
+  r.pause();
+  end(s, pcm);
+  await Bun.sleep(30);
+  expect(statuses(s)).toEqual([["muted", null]]);
+  expect(s.recording).toBe(false);
+  expect(whisper.requests).toBe(0);
+  expect(link.calls).toEqual([]);
+  expect(transcript(path)).toBe("");
+});
+
+test("muted, a passage cut by a stop is written up to the stop; the rest is dropped, unheard", async () => {
+  const { recorder: r, path } = recorder(),
+    { s, whisper, link } = session(["private", "never heard"], { recorder: r });
+  await s.start();
+  r.start(path);
+  s.setMuted(true);
+  const pcm = shapes.speech();
+  begin(s, pcm);
+  const stopped = r.stop()!;
+  end(s, pcm);
+  expect(await stopped).toEqual({ path, late: 0 });
+  await until(() => s.history[0]?.status === "recorded");
+  expect(statuses(s)).toEqual([
+    ["recorded", "muted"],
+    ["muted", null],
+  ]);
+  expect(s.recording).toBe(false);
+  expect(whisper.requests).toBe(1);
+  expect(link.calls).toEqual([]);
+  expect(transcript(path)).toBe("private\n");
 });
 
 test("a recording asks nothing more of the link: only the passage that is typed reaches it", async () => {
@@ -1268,13 +1288,27 @@ test("unmuting waits for a voice that can listen, but restoring the earlier stat
   expect(s.muted).toBe(false);
 });
 
-/** A session and recorder on one clock that moves 20 ms with each frame, as live audio does. */
-function clocked(script: string[]) {
-  let clock = 1_000_000;
+/** A session and recorder on one clock that moves 20 ms with each frame, as
+ * live audio does. `tuned` wires the real values: dictation 44 and 2.5 s,
+ * the recording 20 and 1 s with a 10 s cap. `muting` mutes dictation while a
+ * recording runs and restores it at the stop, as main.ts does. */
+function clocked(script: string[], opts: { tuned?: boolean; muting?: boolean } = {}) {
+  let clock = 1_000_000,
+    real: RealTuning | null = null,
+    muting: ((on: boolean) => void) | null = null;
   const dir = mkdtempSync(join(tmpdir(), "corgi-session-"));
   folders.push(dir);
-  const tuning = { pause_break: 2, begin: () => {}, end: () => {} } as unknown as Tuning,
-    r = new Recorder({ tuning, now: () => clock }),
+  const lines: string[] = [],
+    tuning = opts.tuned
+      ? ({
+          get pause_break() {
+            return real!.pause_break;
+          },
+          begin: () => real!.begin(),
+          end: () => real!.end(),
+        } as unknown as Tuning)
+      : ({ pause_break: 2, begin: () => {}, end: () => {} } as unknown as Tuning),
+    r = new Recorder({ tuning, now: () => clock, log: line => lines.push(line), active: on => muting?.(on) }),
     made = session(script, { recorder: r, now: () => clock }),
     play = (pcm: Int16Array) => {
       for (let at = 0; at < pcm.length; at += 320) {
@@ -1282,8 +1316,241 @@ function clocked(script: string[]) {
         made.s.frame(pcm.subarray(at, at + 320));
       }
     };
-  return { ...made, r, play, a: join(dir, "a.txt"), b: join(dir, "b.txt") };
+  if (opts.tuned)
+    real = new RealTuning(made.segmenter, {
+      dictation: { threshold: 44, silence: 2.5 },
+      recording: { threshold: 20, silence: 1, max_chunk: 10, pause_break: 2 },
+      shared: { burst: 0.1, pre_roll: 0.3, post_roll: 1, min_speech: 0.2 },
+    });
+  if (opts.muting) muting = muteWhileRecording(made.s);
+  /** Plays `pcm` one frame at a time, letting a settled stop finish between
+   * frames, until `stopped` settles; the frames it took. */
+  const playUntil = async (pcm: Int16Array, stopped: Promise<unknown>) => {
+    let settled = false,
+      n = 0;
+    void stopped.then(() => (settled = true));
+    for (let at = 0; at < pcm.length && !settled; at += 320, n++) {
+      play(pcm.subarray(at, at + 320));
+      await Bun.sleep(0);
+    }
+    expect(settled).toBe(true);
+    return n;
+  };
+  return { ...made, r, play, playUntil, lines, a: join(dir, "a.txt"), b: join(dir, "b.txt") };
 }
+/** Music at level 30: above the recording threshold (20), under dictation's (44). */
+const music30 = (seconds: number) => tone(seconds, level.percentToRms(30));
+/** A 20 ms peak every 0.2 s: too short to count as speech. */
+const beats = (seconds: number) => concat(...Array.from({ length: seconds * 5 }, () => concat(silence(0.18), tone(0.02))));
+
+test("a stop while loud noise goes on cuts the passage there and closes once its part is written (SC-001)", async () => {
+  const { s, r, playUntil, play, lines, a } = clocked(["before the stop", "after the stop"]);
+  await s.start();
+  r.start(a);
+  // Noise above the threshold: a passage starts and never pauses.
+  play(tone(2));
+  expect(s.recording).toBe(true);
+  const stopped = r.stop()!;
+  expect(lines).toContain(`recording: cut utterance 1 at the stop of ${a}`);
+  // Two frames at most: the transcription of the part before the stop.
+  expect(await playUntil(tone(12), stopped)).toBeLessThanOrEqual(2);
+  expect(await stopped).toEqual({ path: a, late: 0 });
+  const line = lines.find(l => l.startsWith(`recording: stopped ${a}`))!;
+  expect(Number(/waited_ms=(\d+)/.exec(line)![1])).toBeLessThanOrEqual(40);
+  expect(line).toEndWith(" late=0");
+  expect(transcript(a)).toBe("before the stop\n");
+  // The noise goes on and ends later: an utterance of its own, outside the recording.
+  play(concat(tone(1), silence(3)));
+  await until(() => s.history[1]?.status === "delivered");
+  expect(s.history[1]).toMatchObject({ record: null, continues: true });
+  expect(transcript(a)).toBe("before the stop\n");
+});
+
+test("a stop with noise between the recording and the dictation threshold cuts it and closes at once (walkthrough step 5)", async () => {
+  // The live walkthrough: music above the recording threshold but under the
+  // dictation one. Held until its speech provably ended, the passage kept
+  // the stop waiting 1.8 s; cut at the stop, it does not.
+  const { s, r, play, playUntil, lines, a, segmenter } = clocked(["the music"], { tuned: true });
+  await s.start();
+  r.start(a);
+  expect(segmenter.percent).toBe(20);
+  play(music30(2));
+  expect(s.recording).toBe(true);
+  const stopped = r.stop()!;
+  expect(await playUntil(music30(12), stopped)).toBeLessThanOrEqual(2);
+  expect(await stopped).toEqual({ path: a, late: 0 });
+  expect(transcript(a)).toBe("the music\n");
+  expect(lines.some(l => l.startsWith("recording: let go"))).toBe(false);
+});
+
+test("a stop with only peaks shorter than the burst length after it does not wait for the silence window", async () => {
+  const { s, r, play, playUntil, a, segmenter } = clocked(["said before the beats"], { tuned: true });
+  await s.start();
+  r.start(a);
+  play(concat(tone(1.5), beats(0.6)));
+  expect(s.recording).toBe(true);
+  const stopped = r.stop()!;
+  expect(0.02).toBeLessThan(segmenter.timing.burst);
+  expect(await playUntil(beats(10), stopped)).toBeLessThanOrEqual(2);
+  expect(await stopped).toEqual({ path: a, late: 0 });
+  expect(transcript(a)).toBe("said before the beats\n");
+});
+
+test("a passage in its silence window at a stop is cut and written without waiting for the window", async () => {
+  const { s, r, play, playUntil, a } = clocked(["just said"], { tuned: true });
+  await s.start();
+  r.start(a);
+  // Half of the recording's 1 s window.
+  play(concat(tone(1.5), silence(0.5)));
+  expect(s.recording).toBe(true);
+  const stopped = r.stop()!;
+  expect(await playUntil(silence(3), stopped)).toBeLessThanOrEqual(2);
+  expect(await stopped).toEqual({ path: a, late: 0 });
+  expect(transcript(a)).toBe("just said\n");
+  // The part sent ends at the stop, the quiet so far kept; the speech ended before it.
+  const [u] = s.history;
+  expect(u.duration).toBeCloseTo(2, 5);
+  expect(u.speech_end - u.speech_start).toBe(1500);
+});
+
+test("a sentence straddling a stop: its first part is written, the rest is typed as an ordinary utterance", async () => {
+  const { s, r, play, a, link } = clocked(["the first half", "the second half"], { muting: true });
+  await s.start();
+  r.start(a);
+  // The recording mutes dictation; the stop gives it back.
+  expect(s.muted).toBe(true);
+  play(tone(1));
+  const stopped = r.stop()!;
+  expect(s.muted).toBe(false);
+  play(concat(tone(1), silence(3)));
+  expect(await stopped).toEqual({ path: a, late: 0 });
+  await until(() => s.history[1]?.status === "delivered");
+  expect(transcript(a)).toBe("the first half\n");
+  expect(statuses(s)).toEqual([
+    ["recorded", "muted"],
+    ["delivered", null],
+  ]);
+  expect(s.history[1]).toMatchObject({ record: null, continues: true });
+  expect(link.calls.map(c => c.value)).toEqual(["the second half"]);
+});
+
+test("a sentence straddling a stop with dictation muted: the rest is dropped as muted", async () => {
+  const { s, r, play, a, link, whisper } = clocked(["the first half", "never heard"], { muting: true });
+  await s.start();
+  s.setMuted(true);
+  r.start(a);
+  play(tone(1));
+  const stopped = r.stop()!;
+  expect(s.muted).toBe(true);
+  play(concat(tone(1), silence(3)));
+  expect(await stopped).toEqual({ path: a, late: 0 });
+  await until(() => s.history[0]?.status === "recorded");
+  expect(statuses(s)).toEqual([
+    ["recorded", "muted"],
+    ["muted", null],
+  ]);
+  expect(whisper.requests).toBe(1);
+  expect(link.calls).toEqual([]);
+  expect(transcript(a)).toBe("the first half\n");
+});
+
+test("less speech than the minimum before a stop writes nothing, and the stop closes at once", async () => {
+  const { s, r, play, a, whisper } = clocked(["never asked"]);
+  await s.start();
+  r.start(a);
+  play(tone(0.06));
+  expect(s.recording).toBe(true);
+  // No frame needed: nothing is pending.
+  expect(await r.stop()).toEqual({ path: a, late: 0 });
+  expect(s.history[0]).toMatchObject({ status: "dropped", reason: "too short", record: null });
+  play(silence(3));
+  expect(whisper.requests).toBe(0);
+  expect(transcript(a)).toBe("");
+});
+
+test("a stop still waits for a passage being transcribed, with the 10 s bound (FR-003)", async () => {
+  const { s, r, play, a, whisper } = clocked(["ended before", "cut at the stop"]);
+  let open!: () => void;
+  whisper.gate = new Promise(resolve => (open = resolve));
+  await s.start();
+  r.start(a);
+  // Past the 0.5 s window: ended, and Whisper is behind.
+  play(concat(tone(1.5), silence(0.6), tone(1)));
+  expect(s.history[0].status).toBe("transcribing");
+  const timers = spyOn(globalThis, "setTimeout");
+  let stopped: Promise<{ path: string; late: number }>, delays: unknown[];
+  try {
+    stopped = r.stop()!;
+    delays = timers.mock.calls.map(call => call[1]);
+  } finally {
+    timers.mockRestore();
+  }
+  expect(delays).toEqual([stop_wait_ms]);
+  let settled = false;
+  void stopped.then(() => (settled = true));
+  play(tone(0.5));
+  await Bun.sleep(10);
+  expect(settled).toBe(false);
+  open();
+  expect(await stopped).toEqual({ path: a, late: 0 });
+  expect(transcript(a)).toBe("ended before\ncut at the stop\n");
+});
+
+test("the dictation values are back right after a stop, while noise goes on", async () => {
+  const { s, r, play, a, segmenter } = clocked(["kept"], { tuned: true });
+  const caps = spyOn(segmenter, "setCap");
+  await s.start();
+  r.start(a);
+  expect([segmenter.percent, segmenter.timing.silence, caps.mock.calls.at(-1)]).toEqual([20, 1, [10]]);
+  play(tone(2));
+  void r.stop();
+  expect([segmenter.percent, segmenter.timing.silence, caps.mock.calls.at(-1)]).toEqual([44, 2.5, [30]]);
+});
+
+test("after a pause and a stop, a click shorter than the burst length does not let go of the passage held since the pause (FR-001)", async () => {
+  const { s, r, play, lines, a, segmenter } = clocked(["kept"]);
+  await s.start();
+  r.start(a);
+  play(concat(tone(1.5), silence(0.2)));
+  r.pause();
+  const stopped = r.stop()!;
+  // Paused: nothing it would write is being spoken, so nothing is cut.
+  expect(lines.some(l => l.includes("cut utterance"))).toBe(false);
+  // Two loud frames, under the burst length: the pause runs on through them.
+  expect(0.04).toBeLessThan(segmenter.timing.burst);
+  play(concat(tone(0.04), silence(3)));
+  expect(await stopped).toEqual({ path: a, late: 0 });
+  expect(transcript(a)).toBe("kept\n");
+});
+
+test("after a pause and a stop, speech that goes on lets go of the held passage, and the stop closes then", async () => {
+  const { s, r, play, playUntil, a, segmenter } = clocked(["went on"]);
+  await s.start();
+  r.start(a);
+  play(concat(tone(1.5), silence(0.2)));
+  r.pause();
+  const stopped = r.stop()!;
+  // Speaking again: the passage's speech goes on past the pause.
+  expect(0.2).toBeGreaterThanOrEqual(segmenter.timing.burst);
+  const frames = await playUntil(concat(tone(0.2), tone(5)), stopped);
+  expect(frames * 20).toBeLessThanOrEqual(segmenter.timing.burst * 1000 + 100);
+  expect(await stopped).toEqual({ path: a, late: 0 });
+  play(silence(3));
+  await until(() => s.history[0]?.status === "delivered");
+  expect(transcript(a)).toBe("");
+});
+
+test("a passage near the cap's length at a stop is cut at the stop and written", async () => {
+  const { s, r, play, a } = clocked(["the long one"]);
+  await s.start();
+  r.start(a);
+  play(concat(tone(29.8), silence(0.1)));
+  // The cap would cut 0.1 s later; the stop cuts first.
+  const stopped = r.stop()!;
+  play(silence(3));
+  expect(await stopped).toEqual({ path: a, late: 0 });
+  expect(transcript(a)).toBe("the long one\n");
+});
 
 test("a passage whose speech ended before a pause, in its silence window, is written (FR-004a)", async () => {
   const { s, r, play, a } = clocked(["said before the pause"]);
@@ -1308,44 +1575,6 @@ test("a passage whose speech ended before a stop goes to that file, not to one s
   expect(transcript(a)).toBe("the last words of a\n");
   play(concat(tone(1.5), silence(3)));
   await until(() => transcript(b) === "the first words of b\n");
-});
-
-test("speech that goes on past a stop is not written to the stopped recording", async () => {
-  const { s, r, play, a } = clocked(["still talking"]);
-  await s.start();
-  r.start(a);
-  play(tone(1));
-  const stopped = r.stop()!;
-  play(concat(tone(1), silence(3)));
-  expect(await stopped).toEqual({ path: a, late: 0 });
-  await until(() => s.history[0]?.status === "delivered");
-  expect(transcript(a)).toBe("");
-});
-
-test("a stop does not wait for, or count as late, speech that goes on past its bound", async () => {
-  const { s, r, play, a } = clocked(["kept talking"]);
-  await s.start();
-  r.start(a);
-  play(tone(1));
-  const stopped = r.stop(100)!;
-  play(tone(0.5));
-  expect(await stopped).toEqual({ path: a, late: 0 });
-  play(concat(tone(0.5), silence(3)));
-  await until(() => s.history[0]?.status === "delivered");
-  expect(transcript(a)).toBe("");
-});
-
-test("a stop holding the passage in progress settles at once when that passage is dropped", async () => {
-  const { s, r, play, a } = clocked([]);
-  await s.start();
-  r.start(a);
-  play(tone(0.06));
-  const started = Date.now(),
-    stopped = r.stop(5000)!;
-  // Too short to count: dropped, and the stop need not wait for it.
-  play(silence(3));
-  expect(await stopped).toEqual({ path: a, late: 0 });
-  expect(Date.now() - started).toBeLessThan(1000);
 });
 
 test("speech that goes on past a pause is not written to the paused recording", async () => {
@@ -1377,7 +1606,7 @@ test("a passage begun without a viewer and cut loose by a pause keeps its reason
   expect(transcript(a)).toBe("");
 });
 
-test("quitting in the silence window of a passage that ended before the stop counts it as left out", async () => {
+test("quitting right after a stop counts the cut passage still being transcribed as left out", async () => {
   const { s, r, play, a } = clocked(["just before quit"]);
   await s.start();
   r.start(a);
@@ -1390,21 +1619,24 @@ test("quitting in the silence window of a passage that ended before the stop cou
   expect(transcript(a)).toBe("");
 });
 
-test("speech that went on past a stop is not late, even when the bound or a quit lands between words", async () => {
-  // The stop's bound passes in a short gap of speech that began after the stop.
-  const one = clocked(["went on"]);
-  await one.s.start();
-  one.r.start(one.a);
-  one.play(tone(1));
-  const stopped = one.r.stop(100)!;
-  one.play(concat(tone(0.5), silence(0.1)));
-  expect(await stopped).toEqual({ path: one.a, late: 0 });
-  // A second quit press in a short gap of speech that went on 1 s past the stop.
-  const two = clocked(["went on too"]);
-  await two.s.start();
-  two.r.start(two.a);
-  two.play(tone(1));
-  void two.r.stop();
-  two.play(concat(tone(1), silence(0.2)));
-  expect(two.r.finish()).toEqual([{ path: two.a, late: 0 }]);
+test("the session keeps the machine whose error forms the reason, and a change of it alone is news", async () => {
+  const { s, link } = session([]);
+  await s.start();
+  let changes = 0;
+  s.on("change", () => changes++);
+  const lost = (source: string | null): Seen => ({
+    ...unreachable("Corgi unreachable: JSON Parse error: Unexpected EOF"),
+    source,
+  });
+  link.events.emitViewer(lost("local"));
+  expect(s.source).toBe("local");
+  const after = changes;
+  link.events.emitViewer(lost("local"));
+  expect(changes).toBe(after);
+  link.events.emitViewer(lost("marovo"));
+  expect(s.source).toBe("marovo");
+  expect(changes).toBe(after + 1);
+  // A view without one clears it.
+  link.events.emitViewer(seen(true, "dictation"));
+  expect(s.source).toBeNull();
 });

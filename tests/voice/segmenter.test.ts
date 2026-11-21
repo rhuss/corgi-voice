@@ -125,6 +125,52 @@ test("speech shorter than the minimum is kept when it carries on a cut at the ca
   expect(feed(concat(silence(1), tone(0.1), silence(3)), { silence: 1 }).segments).toEqual([]);
 });
 
+test("a cut sends what the utterance holds so far, untrimmed, and listening carries on (FR-001)", () => {
+  const { segmenter, segments, push } = live({ silence: 1 });
+  // Speech, then 0.4 s into the silence window.
+  push(concat(silence(1), tone(1.5), silence(0.4)));
+  const end = segmenter.speechEnd,
+    [s, ...more] = segmenter.cut();
+  expect(more).toEqual([]);
+  // 0.3 s pre-roll, the speech and the quiet so far: no post-roll trimming, as at the cap.
+  expect(s.duration).toBeCloseTo(2.2, 5);
+  expect(s.pcm.length).toBe(2.2 * 16000);
+  expect([s.capped, s.continues, s.kept, s.dropped]).toEqual([true, false, 0.4, 0]);
+  // The speech ends where its last loud stretch did, not at the cut.
+  expect(s.speech_start).toBe(s.started_at + 300);
+  expect(s.speech_end).toBe(s.speech_start + 1500);
+  expect(s.speech_end).toBe(end!);
+  expect(s.cut_at).toBe(s.started_at + 2200);
+  // The rest carries on the cut: it starts there, exactly.
+  expect(segmenter.recording).toBe(true);
+  push(concat(tone(0.5), silence(3)));
+  expect(segments).toHaveLength(1);
+  expect(segments[0].continues).toBe(true);
+  expect(segments[0].speech_start).toBe(s.cut_at!);
+  expect(segments[0].speech_end - segments[0].speech_start).toBe(500);
+});
+
+test("a cut while speech goes on ends the speech at the cut", () => {
+  const { segmenter } = feed(concat(silence(1), tone(1)));
+  const [s] = segmenter.cut();
+  expect(s.speech_end).toBe(s.cut_at!);
+  expect(s.kept).toBe(0);
+  expect(segmenter.recording).toBe(true);
+});
+
+test("a cut with too little speech sends nothing, and a quiet rest ends without a segment", () => {
+  const { segmenter, segments, push } = live({ silence: 1 });
+  push(concat(silence(1), tone(0.1)));
+  expect(segmenter.cut()).toEqual([]);
+  expect(segmenter.recording).toBe(true);
+  push(silence(3));
+  expect(segments).toEqual([]);
+  expect(segmenter.recording).toBe(false);
+  // Nothing in progress: nothing to cut.
+  expect(segmenter.cut()).toEqual([]);
+  expect(segmenter.recording).toBe(false);
+});
+
 test("two bursts are two utterances", () => {
   // The first starts the stream, so only the second has pre-roll.
   expect(feed(shapes.two()).segments.map(s => s.duration)).toEqual([2.5, 2.8]);

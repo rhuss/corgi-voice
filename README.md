@@ -42,7 +42,10 @@ corgi-voice --setup --model small.en
 ```
 
 Setup checks for `whisper-server`, `ffmpeg` and the `corgi` command, downloads the Whisper model and the speech filter (Silero VAD) with progress, and prints what is ready and what is missing, with install hints.
-It exits with status 1 while something required is missing.
+For `corgi`, it also runs `corgi list --json` once (bounded at 3 seconds, no pane is touched) to check that this `corgi` can talk to the Corgi that runs.
+A `corgi` of another build answers with an error, and setup reports `[mismatch]` with that error and the fix (see [Corgi unreachable](#corgi-unreachable)).
+When Corgi is not running or does not answer in time, setup prints a `[note]` and goes on.
+It exits with status 1 while something required is missing or the `corgi` command does not match.
 
 If you used `corgi voice` before, setup (and the first start) takes over its settings and models:
 the settings file is copied, and each model is hard linked (or copied) from the old cache instead of downloaded.
@@ -127,16 +130,53 @@ An utterance cut at the 30 second cap (or a recording's `max_chunk`) is sent who
 
 ### Recording
 
-`r` opens a prompt for the file name, suggested as `YYYY-MM-DD-.txt` with the caret before `.txt`.
-A relative name goes into the transcript folder (sub-folders are made, private to you); `~/` and absolute paths are used as given.
-A name that leaves the transcript folder with `..` is refused.
-If the file exists, the prompt says so and the recording appends after one blank line.
-Editing keys: Backspace, Left and Right, Home and End, Ctrl+A, Ctrl+E, Ctrl+U, Ctrl+W. Enter records, Esc cancels.
+`r` opens a prompt with one field: the full path of the transcript file, such as `~/.local/share/corgi/transcripts/2026-11-21-.txt`, with the caret before `.txt`.
+The path starts in the transcript folder, then in the folder the last recording of this run went to.
+Edit it like any text: Backspace, Left and Right, Home and End, Ctrl+A, Ctrl+E, Ctrl+U, Ctrl+K, Ctrl+W.
+Enter records, Esc cancels.
+
+Paths under the home folder show as `~/`, others as absolute paths.
+A relative path goes into the transcript folder; `..` parts are resolved, so any folder can be chosen.
+Missing folders are made when the recording starts, private to you.
+A line under the field appears only when the file exists (the recording appends after one blank line) or when the path is refused, such as one that ends in `/`, names a folder, or goes through a file; Enter then does nothing.
+A long path scrolls in the field to keep the caret in view, with `…` where it is cut.
+
+Tab opens a folder pop-down at the caret:
+
+- With the caret in the file name, it lists the sub-folders of the file's folder, and the folder you take goes in front of the file name.
+- With the caret inside a folder of the path, it lists the folders next to that one that match the text before the caret, and the folder you take replaces it.
+- Typing filters the list (names starting with the text first, then names containing it, ignoring case), shown in the pop-down's frame, and Backspace edits the filter.
+- Up and Down pick, Enter or Tab take the picked folder, Esc closes the pop-down without changes.
+
+The pop-down shows up to 8 folders at a time and scrolls, saying how many more there are.
+Folders starting with `.` are listed once the filter starts with a dot.
+A folder that cannot be read, or has no sub-folders, shows a short note that goes away with the next key.
+
+Backspace with the caret at the start of the file name removes the folder in front of it, so going up is one key per level, up to `/`.
+
+Stopping (`R`) cuts what is being said at that moment: the part before `R` is written, and the rest goes on as ordinary dictation (typed when dictation is on, dropped when it is muted).
+The file closes as soon as that last part is transcribed, whatever the background does.
 
 The transcript has one line per passage and a blank line before each new contribution (a pause longer than `pause_break`).
 Each passage is synced to disk as it is written.
 Starting a recording mutes dictation; stopping it puts the mute back as it was.
 When corgi-voice ends while passages are still being transcribed, by a second quit press or by a signal, the transcript is closed without them and the terminal says how many were left out.
+
+## Troubleshooting
+
+### Corgi unreachable
+
+The window says `Corgi unreachable: …` and nothing is typed, although Corgi runs.
+The usual cause is a `corgi` command of another build than the Corgi that runs: an older release on `PATH` while your shell alias points to a newer one, for example.
+Its `list --json` then fails with an error such as `JSON Parse error: Unexpected identifier "HTTP"` or `unknown command`.
+The status line adds `set "corgi" in voice.json to the corgi your Corgi runs`, and `corgi-voice --setup` reports:
+
+```text
+[mismatch] corgi /usr/local/bin/corgi cannot talk to the running Corgi: JSON Parse error: Unexpected identifier "HTTP"
+         set "corgi" in voice.json, or pass --corgi, to the corgi your Corgi runs
+```
+
+Set `"corgi"` in `voice.json` to the path of the `corgi` your Corgi runs (see [Finding corgi](#finding-corgi)), or pass it with `--corgi`, and run `corgi-voice --setup` again until it reports `[ok] corgi`.
 
 ## Settings
 
@@ -192,7 +232,7 @@ Read only, for taking over from `corgi voice`: `$XDG_STATE_HOME/corgi/voice.json
 - No voice indicator in Corgi's sidebar, and no mute shortcut inside Corgi: the voice window is the only place showing voice state, and `m` there is the mute.
 - No `--ssh`: remote machines come through Corgi's own remote machines.
 - Settings and models live in corgi-voice's own folders (taken over on first start).
-- The recording prompt is a single file name field; Corgi's folder browser is not reproduced.
+- The recording prompt is one path field with a folder pop-down on Tab, not Corgi's folder browser; it does not list existing transcripts.
 
 ## Do not run both
 

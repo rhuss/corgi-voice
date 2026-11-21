@@ -10,6 +10,7 @@ import { fakeCorgi, type FakeCorgi } from "../fixtures/corgi";
 const fixtures = resolve(import.meta.dir, "../fixtures/voice"),
   saved = process.env.XDG_CACHE_HOME,
   bun = dirname(process.execPath);
+const reachable = { machines: { local: { stdout: '{"viewers":[]}' } } };
 let fake: FakeCorgi;
 let dir = "",
   served: Record<string, Uint8Array<ArrayBuffer>> = {},
@@ -22,7 +23,8 @@ beforeEach(() => {
   // The process's own cache is somewhere else than the one setup is given:
   // whatever read or wrote there would not have taken the injected env.
   process.env.XDG_CACHE_HOME = join(dir, "not-the-given-cache");
-  fake = fakeCorgi();
+  // A running Corgi this corgi can talk to: list --json answers with viewers.
+  fake = fakeCorgi(reachable);
   requests = [];
   midway = null;
   server = Bun.serve({
@@ -193,6 +195,91 @@ test("the corgi command is checked: found with pane send --stdin, missing, or to
   expect(code).toBe(1);
   expect(out).toContain('[too old] corgi: this corgi');
   expect(out).toContain("pane send --stdin");
+});
+
+/** The lines setup printed about the corgi command. */
+const corgiLines = (out: string) => out.split("\n").filter(l => /^\[[a-z ]+\] corgi\b/.test(l));
+/** The calls of `list --json`, setup's reachability probe. */
+const probes = () => fake.calls().filter(c => c.argv.join(" ") === "list --json");
+
+test("a corgi that talks to the running Corgi is ok, probed once with list --json", async () => {
+  const entries = { model: entry("base.en", "m"), filter: entry("filter", "f") },
+    { code, out } = await report(entries);
+  expect(code).toBe(0);
+  expect(corgiLines(out)).toEqual([`[ok] corgi ${fake.cmd}`]);
+  expect(probes()).toHaveLength(1);
+  // The probe never touches a pane: the only other call is the capability check.
+  expect(fake.calls().map(c => c.argv.join(" "))).toEqual(["pane send --help", "list --json"]);
+});
+
+test("a corgi that cannot talk to the running Corgi is a mismatch, with the fix, and setup fails", async () => {
+  const entries = { model: entry("base.en", "m"), filter: entry("filter", "f") };
+  fake.set({
+    machines: { local: { stdout: '{"ok":false,"err":"JSON Parse error: Unexpected identifier \\"HTTP\\""}', code: 1 } },
+  });
+  let { code, out } = await report(entries);
+  expect(code).toBe(1);
+  expect(corgiLines(out)).toEqual([
+    `[mismatch] corgi ${fake.cmd} cannot talk to the running Corgi: JSON Parse error: Unexpected identifier "HTTP"`,
+  ]);
+  expect(out).toContain(
+    `[mismatch] corgi ${fake.cmd} cannot talk to the running Corgi: JSON Parse error: Unexpected identifier "HTTP"\n` +
+      `         set "corgi" in voice.json, or pass --corgi, to the corgi your Corgi runs\n`,
+  );
+  expect(out).toContain("Voice is not ready");
+  // A reply without viewers, and an error no table knows, count the same.
+  fake.set({ machines: { local: { stdout: '{"panes":[]}' } } });
+  ({ code, out } = await report(entries));
+  expect(code).toBe(1);
+  expect(corgiLines(out)).toEqual([
+    `[mismatch] corgi ${fake.cmd} cannot talk to the running Corgi: Corgi output not understood`,
+  ]);
+  fake.set({ machines: { local: { stderr: "corgi: something new went wrong\n", code: 1 } } });
+  ({ code, out } = await report(entries));
+  expect(code).toBe(1);
+  expect(corgiLines(out)[0]).toEndWith("cannot talk to the running Corgi: something new went wrong");
+});
+
+test("a Corgi that is not running is a note, and voice is still ready", async () => {
+  const entries = { model: entry("base.en", "m"), filter: entry("filter", "f") };
+  fake.set({ machines: { local: { stdout: '{"ok":false,"err":"NoRuntime"}', code: 1 } } });
+  let { code, out } = await report(entries);
+  expect(code).toBe(0);
+  expect(corgiLines(out)).toEqual([
+    `[note] corgi: Corgi is not running; could not check that ${fake.cmd} talks to it`,
+  ]);
+  expect(out).toContain("Voice is ready");
+  fake.set({ machines: { local: { stderr: "corgi: ConnectionRefused\n", code: 1 } } });
+  ({ code, out } = await report(entries));
+  expect(code).toBe(0);
+  expect(corgiLines(out)[0]).toStartWith("[note] corgi: Corgi is not running");
+});
+
+test("a slow Corgi is a note, past the probe's bound or RequestTimedOut, and voice is still ready", async () => {
+  const entries = { model: entry("base.en", "m"), filter: entry("filter", "f") };
+  fake.set({ machines: { local: { stdout: '{"viewers":[]}', delayMs: 2000 } } });
+  let out = "";
+  const code = await setup.run(
+    { model: "base.en", corgi: fake.cmd },
+    { write: text => (out += text), entries, path: `${fixtures}:${bun}`, env: env(), reachMs: 200 },
+  );
+  expect(code).toBe(0);
+  expect(corgiLines(out)).toEqual(["[note] corgi: no answer in time"]);
+  fake.set({ machines: { local: { stderr: "corgi: RequestTimedOut\n", code: 1 } } });
+  const again = await report(entries);
+  expect(again.code).toBe(0);
+  expect(corgiLines(again.out)).toEqual(["[note] corgi: no answer in time"]);
+});
+
+test("no probe runs when the corgi command is missing or too old", async () => {
+  const entries = { model: entry("base.en", "m"), filter: entry("filter", "f") };
+  let { out } = await report(entries, `${fixtures}:${bun}`, "corgi-custom");
+  expect(corgiLines(out)).toHaveLength(1);
+  fake.set({ ...reachable, help: { stdout: "corgi pane send ID TEXT [--enter]\n" } });
+  ({ out } = await report(entries));
+  expect(corgiLines(out)).toHaveLength(1);
+  expect(corgiLines(out)[0]).toStartWith("[too old] corgi: ");
+  expect(probes()).toEqual([]);
 });
 
 test("models of the in-Corgi voice mode are taken before anything is downloaded", async () => {

@@ -91,3 +91,57 @@ Ideas captured from code reviews for future brainstorming.
 - **Summary**: `--setup` reported `[ok] corgi` for an old release that could not talk to the running Corgi (`JSON Parse error: Unexpected identifier "HTTP"`); setup should try `list --json` and warn, and the window's error should hint that the `corgi` command may not match the running Corgi (set `corgi` in voice.json).
 
 > Two small changes: a reachability check in setup, a hint for protocol-looking errors.
+
+### reach-classify-first-line
+
+- **Source**: deep-review
+- **Date**: 2026-11-20
+- **Reference**: 002-walkthrough-fixes
+- **Summary**: Setup's probe classifies all of corgi's standard error while FR-008 says the first line, so setup and the window can disagree on one failure.
+
+> Either update the FR-008 wording (all of the text is more robust for Bun errors) or classify the first line only.
+
+### tab-cycle-accept-descend
+
+- **Source**: deep-review
+- **Date**: 2026-11-20
+- **Reference**: 002-walkthrough-fixes
+- **Summary**: While Tab cycles through matches there is no way to accept one and go a level deeper; another key has to end cycling first.
+
+> Matches FR-005; zsh menu users may expect `/` to accept the match.
+
+### completion-lexical-containment
+
+- **Source**: deep-review
+- **Date**: 2026-11-20
+- **Reference**: 002-walkthrough-fixes
+- **Summary**: Completion and resolve keep names inside the transcript folder as written, not on disk: a link inside it to a folder outside is offered and accepted.
+
+> As the spec asks; compare real paths if a guarantee on disk is ever wanted.
+
+### bidi-characters-on-screen
+
+- **Source**: deep-review
+- **Date**: 2026-11-20
+- **Reference**: 002-walkthrough-fixes
+- **Summary**: `spaced()` keeps bidi and format characters, and folder completion is a new way for them to reach the screen.
+
+> No escape injection, but a name can look like another; extend `controls` if spoofing matters.
+
+### probe-kill-process-group
+
+- **Source**: deep-review
+- **Date**: 2026-11-20
+- **Reference**: 002-walkthrough-fixes
+- **Summary**: A timed-out subprocess is killed, but not its process group, so a `corgi` wrapper script that does not `exec` leaves the real process running.
+
+> Spawn detached and kill the group if it ever matters.
+
+### fr011-end-to-end-test
+
+- **Source**: deep-review
+- **Date**: 2026-11-20
+- **Reference**: 002-walkthrough-fixes
+- **Summary**: No single test drives a mismatch reply from the fake corgi through poller, link, session and window to the hinted status line.
+
+> Each layer is tested on its own; one end-to-end test would pin the walkthrough scenario.
