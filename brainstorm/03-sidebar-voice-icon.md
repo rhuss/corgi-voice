@@ -104,6 +104,20 @@ corgi-voice side:
 - Where the Corgi-side spec lives (`corgi-specs` or the Corgi fork) and whether to open an upstream issue before the PR.
 - Should a refused click during recording give feedback after all (a short flash, or a hover hint)?
 
+## Update 2026-11-22: Corgi side is up
+
+Deliverable 1 is [tals/corgi#198](https://github.com/tals/corgi/pull/198) ("tricks: let a trick place an item in the sidebar title row"), branch `rhuss:011-tricks-title-item`, stacked on `tricks` (#74). It answers the Corgi-side open questions above. The corgi-voice trick is built against it; the authoritative reference is `docs/tricks.md` on that branch (sections "Title items" and "Raw JSONL").
+
+- Raw wire: `{"op":"ui.set","key":"voice","view":{"kind":"title","spans":[{"text":"♫"}],"color":"<palette name>","action":"<id>"}}`; `ui.remove` with the key clears it. Optional `slot` follows the button rules.
+- An item is one line of 1 to 4 cells (a brand icon counts as two); one title item per trick. Errors: `TitleTooWide`, `InvalidTitle`, `TitleExists` (a second key while one is drawn; reuse one key and replace it).
+- Without `color` an item is muted gray. Palette names include `hot` and `faint`; pick the listening color from the names Corgi offers (verify in the spec phase).
+- Presses arrive as `{event:"ui.press", action, viewer}`. Action IDs must be unique per drawing revision (at most 80 ASCII characters).
+- Several tricks' items sit in trick ID order; when the row runs short, the title shortens first, then items drop whole, last first. `[ + ]`, `<` and the corgi badge never move.
+- A viewer shows the title items of the daemon it attached to first, even while it shows another machine, so the laptop's voice trick stays visible there. Tricks on other machines' daemons do not reach the row, which settles the remote question; the "draw nothing without `control.sock`" rule still applies if the trick is installed on a remote daemon.
+- No item while that first connection is down; items return with the daemon's next update.
+
+Remaining open questions for the corgi-voice spec: PATH resolution for the raw command trick, feedback for a refused click while recording, and the exact listening color.
+
 ## Follow-ups (out of scope)
 
 - B as an optional hint on the target agent's row.
