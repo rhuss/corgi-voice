@@ -28,15 +28,22 @@ function executable(file: string): boolean {
   }
 }
 /**
- * The `corgi` command: `--corgi` (`flag`), else the `corgi` setting, else
- * `corgi` on PATH. A value with a `/` (or `~/`) is a path to an executable;
- * anything else is a name looked up on PATH. A shell alias is neither, so the
- * message for a value that is not found says to give the executable's path.
+ * The `corgi` command: `--corgi` (`flag`), else `$CORGI_APP_EXE` when it is
+ * an absolute path to an executable (Corgi sets it in each pane to the binary
+ * of the Corgi running that pane, so it always speaks its protocol), else the
+ * `corgi` setting, else `corgi` on PATH. A value with a `/` (or `~/`) is a
+ * path to an executable; anything else is a name looked up on PATH. A shell
+ * alias is neither, so the message for a value that is not found says to
+ * give the executable's path.
  */
 export function resolveCorgi(
   given: { flag?: string | null; setting?: string | null },
   env: NodeJS.ProcessEnv = process.env,
 ): Found {
+  // A pane of a Corgi whose build has since moved keeps a stale path: then
+  // the setting and PATH still get their turn.
+  const app = env.CORGI_APP_EXE;
+  if (!given.flag && app && isAbsolute(app) && executable(app)) return { ok: true, cmd: app };
   const value = given.flag || given.setting || "corgi";
   let found: string | null = null;
   if (value.startsWith("~/")) found = join(paths.home(env), value.slice(2));

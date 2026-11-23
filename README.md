@@ -85,7 +85,10 @@ Flags:
 
 ### Finding corgi
 
-corgi-voice runs `--corgi CMD` if given, else the `corgi` setting in `voice.json`, else `corgi` on `PATH`.
+corgi-voice runs `--corgi CMD` if given, else `$CORGI_APP_EXE`, else the `corgi` setting in `voice.json`, else `corgi` on `PATH`.
+Corgi sets `CORGI_APP_EXE` in each of its panes to the binary of the Corgi that runs the pane, so a corgi-voice started in a Corgi pane uses a `corgi` that always talks to that Corgi, also a custom build that moved.
+It is used only when it is an absolute path to an executable; a stale one (a pane of a Corgi whose build has since moved) is passed over.
+Outside Corgi, export it yourself to the binary you run, for example `[[ -x ${CORGI_APP_EXE:-} ]] || export CORGI_APP_EXE=~/bin/corgi-custom` in your shell setup.
 A shell alias (such as `alias corgi=~/bin/corgi-custom`) cannot be run by another program.
 If your `corgi` is an alias, pass the executable's path: `corgi-voice --corgi ~/bin/corgi-custom`, or set it in `voice.json`.
 

@@ -260,8 +260,9 @@ function installTrick(): number {
   }
 }
 /** The `corgi` command for this run, checked; throws `CorgiMissing` with the reason as `detail`. */
-async function corgiCommand(s: settings.VoiceSettings): Promise<string> {
-  const found = resolveCorgi({ setting: s.corgi });
+async function corgiCommand(s: settings.VoiceSettings, flag: string | null | undefined): Promise<string> {
+  // The flag beats CORGI_APP_EXE; the setting (s.corgi without a flag) does not.
+  const found = resolveCorgi({ flag, setting: s.corgi });
   if (!found.ok) throw Object.assign(Error("CorgiMissing"), { detail: found.error });
   const checked = await checkCapabilities(found.cmd);
   if (!checked.ok) throw Object.assign(Error("CorgiMissing"), { detail: checked.error });
@@ -337,7 +338,7 @@ export async function main(args: string[], opts: { terminal?: boolean } = {}): P
     held: Held = {},
     end = ending(held, { log: line => logger.info(line) });
   try {
-    const cmd = await corgiCommand(s);
+    const cmd = await corgiCommand(s, given.corgi);
     // One corgi-voice at a time, so the same speech is never typed twice.
     const lock = acquire();
     if (!lock.ok) throw Object.assign(Error("AlreadyRunning"), { detail: lock.message });

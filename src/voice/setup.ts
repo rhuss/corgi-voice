@@ -134,7 +134,7 @@ export async function run(
     ready = false;
     write(`[missing] ffmpeg: install with ${hint("ffmpeg")}\n`);
   }
-  const corgi = resolveCorgi({ setting: corgiCmd }, { ...env, PATH: path }),
+  const corgi = resolveCorgi({ flag: opts.corgi, setting: corgiCmd }, { ...env, PATH: path }),
     // The path and corgi's own error text may hold control characters: they
     // show as spaces, as everywhere on screen.
     say = (line: string) => write(spaced(line) + "\n");

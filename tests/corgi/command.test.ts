@@ -36,6 +36,27 @@ test("--corgi beats the setting, which beats corgi on PATH", () => {
   expect(resolveCorgi({ setting: null }, env)).toEqual({ ok: true, cmd: join(dir, "corgi") });
 });
 
+test("CORGI_APP_EXE beats the setting and PATH, but not --corgi", () => {
+  const dir = bin("corgi", "corgi-flag", "corgi-setting", "corgi-app"),
+    app = join(dir, "corgi-app"),
+    env = { PATH: dir, HOME: "/home/me", CORGI_APP_EXE: app };
+  expect(resolveCorgi({ setting: "corgi-setting" }, env)).toEqual({ ok: true, cmd: app });
+  expect(resolveCorgi({ setting: null }, env)).toEqual({ ok: true, cmd: app });
+  expect(resolveCorgi({ flag: "corgi-flag", setting: "corgi-setting" }, env)).toEqual({
+    ok: true,
+    cmd: join(dir, "corgi-flag"),
+  });
+});
+
+test("a stale, relative or empty CORGI_APP_EXE is passed over", () => {
+  const dir = bin("corgi", "corgi-setting");
+  for (const CORGI_APP_EXE of [join(dir, "gone"), "corgi", "", dir])
+    expect([CORGI_APP_EXE, resolveCorgi({ setting: "corgi-setting" }, { PATH: dir, CORGI_APP_EXE })]).toEqual([
+      CORGI_APP_EXE,
+      { ok: true, cmd: join(dir, "corgi-setting") },
+    ]);
+});
+
 test("a path is used as given when it is an executable file", () => {
   const dir = bin("my-corgi");
   expect(resolveCorgi({ flag: join(dir, "my-corgi") }, { PATH: "" })).toEqual({
