@@ -1,0 +1,15 @@
+# Reference manifest for corgi-voice's sidebar voice icon.
+#
+# Prefer `corgi-voice --install-trick`: it writes this manifest into Corgi's
+# tricks folder with absolute paths for bun and corgi-voice and with the
+# control channel's path below, because Corgi starts tricks with a reduced
+# environment (its PATH may not find bun or corgi-voice, and XDG_RUNTIME_DIR
+# and XDG_STATE_HOME are not passed). This copy relies on PATH and on the
+# default channel path, so it works only where those match.
+version = 1
+id = "corgi-voice"
+description = "Shows **corgi-voice** in the sidebar title row; click to mute."
+command = ["corgi-voice", "--trick"]
+
+# [config]
+# socket = "/Users/me/.local/state/corgi-voice/control.sock"

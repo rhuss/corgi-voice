@@ -29,22 +29,37 @@ export async function request(path: string, op: Op, opts: { timeoutMs?: number }
   return { ok: false, why: end === "not_running" ? "not_running" : "no_answer" };
 }
 /** Watches the corgi-voice at `path`: `onAnswer` gets the state now, then
- * every change. "closed" once corgi-voice ends the watch (it quit). */
+ * every change. "closed" once corgi-voice ends the watch (it quit), or once
+ * `signal` aborts it; an aborted signal never connects. */
 export async function watch(
   path: string,
   onAnswer: (answer: Answer) => void,
-  opts: { timeoutMs?: number } = {},
+  opts: { timeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<"closed" | "not_running" | "no_answer"> {
-  // `onAnswer` never ends the watch, so it ends only when corgi-voice does.
-  const end = await converse(path, "watch", opts.timeoutMs ?? timeout_ms, a => {
-    onAnswer(a);
-    return true;
-  });
+  // `onAnswer` never ends the watch, so it ends only when corgi-voice or the signal does.
+  const end = await converse(
+    path,
+    "watch",
+    opts.timeoutMs ?? timeout_ms,
+    a => {
+      onAnswer(a);
+      return true;
+    },
+    opts.signal,
+  );
   return end as Exclude<End, "done">;
 }
 /** One connection: sends `op`, hands each answer line to `onAnswer` while it
- * returns true, and says how it ended. Only the first answer is timed. */
-function converse(path: string, op: Op, timeoutMs: number, onAnswer: (a: Answer) => boolean): Promise<End> {
+ * returns true, and says how it ended. Only the first answer is timed; an
+ * abort of `signal` ends it as "closed". */
+function converse(
+  path: string,
+  op: Op,
+  timeoutMs: number,
+  onAnswer: (a: Answer) => boolean,
+  signal?: AbortSignal,
+): Promise<End> {
+  if (signal?.aborted) return Promise.resolve("closed");
   return new Promise<End>(resolve => {
     const decoder = new TextDecoder();
     let settled = false,
@@ -55,11 +70,14 @@ function converse(path: string, op: Op, timeoutMs: number, onAnswer: (a: Answer)
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      signal?.removeEventListener("abort", aborted);
       try {
         sock?.end();
       } catch {}
       resolve(end);
     };
+    const aborted = () => finish("closed");
+    signal?.addEventListener("abort", aborted, { once: true });
     const timer = setTimeout(() => finish("no_answer"), timeoutMs);
     // Whatever the server closes with: an answer came, or none did.
     const gone = () => finish(answered ? "closed" : "no_answer");

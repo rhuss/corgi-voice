@@ -172,3 +172,21 @@ Ideas captured from code reviews for future brainstorming.
 - **Summary**: On a shared /tmp another user can create `corgi-voice-<uid>` first; the checks refuse it, which denies the control channel.
 
 > Fails closed and is safe; a README note or a less predictable name derived the same way by server and client would help.
+
+### trick-stdin-line-cap
+
+- **Source**: deep-review
+- **Date**: 2026-11-22
+- **Reference**: 004-sidebar-voice-icon
+- **Summary**: The trick's `lines()` buffers standard input without a cap, unlike the control client's `max_answer`.
+
+> Only the trusted Corgi daemon writes there and its pipe is bounded, so it is not exploitable; a shared line splitter with a cap in `src/util/` would make both readers behave alike.
+
+### install-from-worktree-path
+
+- **Source**: deep-review
+- **Date**: 2026-11-22
+- **Reference**: 004-sidebar-voice-icon
+- **Summary**: `--install-trick` pins the realpath of the `main.ts` it ran from, so an install from a temporary checkout or worktree breaks once that folder is removed.
+
+> Printing the written command after the install, or warning on a `/worktrees/` path, would make the pinned path visible.

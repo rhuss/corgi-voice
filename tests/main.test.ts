@@ -1,5 +1,5 @@
 import { test, expect, afterEach } from "bun:test";
-import { closeSync, existsSync, ftruncateSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, ftruncateSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import {
@@ -807,6 +807,47 @@ test("control flags mixed with each other or with voice-window flags are usage e
   for (const flag of ["--mute", "--unmute", "--toggle-mute", "--status", "--watch", "--json"]) expect(usage).toContain(flag);
 });
 
+test("--trick and --install-trick stand alone; anything with them is a usage error (FR-012)", async () => {
+  expect(flags(["--trick"])).toEqual({ trick: true });
+  expect(flags(["--install-trick"])).toEqual({ install_trick: true });
+  for (const mode of ["--trick", "--install-trick"])
+    for (const other of [
+      ["--trick"],
+      ["--install-trick"],
+      ["--mute"],
+      ["--unmute"],
+      ["--toggle-mute"],
+      ["--status"],
+      ["--watch"],
+      ["--json"],
+      ["--setup"],
+      ["--help"],
+      ["--verbose"],
+      ["--no-filter"],
+      ["--model", "base.en"],
+      ["--threshold", "40"],
+      ["--silence", "2"],
+      ["--port", "9000"],
+      ["--device", "mic"],
+      ["--transcripts", "/tmp/t"],
+      ["--corgi", "corgi"],
+    ])
+      for (const bad of [
+        [mode, ...other],
+        [...other, mode],
+      ]) {
+        expect(() => flags(bad)).toThrow("Usage");
+        const r = await command(bad);
+        expect([bad.join(" "), r.code]).toEqual([bad.join(" "), 2]);
+      }
+  for (const text of [
+    "corgi-voice --trick | --install-trick",
+    "--trick            run as Corgi's sidebar voice icon (started by Corgi)",
+    "--install-trick    install that trick into Corgi's tricks folder",
+  ])
+    expect(usage).toContain(text);
+});
+
 test("a control command reads no settings, runs no migration and takes no lock (FR-010)", async () => {
   const plant = () => {
     // The in-Corgi voice mode's settings, which a voice start would take over.
@@ -917,4 +958,120 @@ test("a removed working folder is reported, not a crash inside Bun", async () =>
   expect(status).toBe(1);
   expect(stderr).toContain("the current folder no longer exists");
   expect(stderr).not.toContain("TypeError");
+});
+
+test("--trick runs without a terminal: empty input exits 0 with nothing written (FR-009)", async () => {
+  const entry = resolve(import.meta.dir, "../src/main.ts"),
+    dir = mkdtempSync(join(tmpdir(), "cv-trk-"));
+  try {
+    const child = Bun.spawn([process.execPath, entry, "--trick"], {
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+        env: { HOME: dir, PATH: process.env.PATH, XDG_RUNTIME_DIR: dir, XDG_STATE_HOME: join(dir, "s") },
+      }),
+      [out, err, status] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    expect([status, out, err]).toEqual([0, "", ""]);
+    // No lock and no settings: the trick takes nothing over.
+    expect(existsSync(join(dir, "corgi-voice.lock"))).toBe(false);
+    expect(existsSync(join(dir, "s"))).toBe(false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("--trick reads Corgi's lines on stdin and writes its commands on stdout", async () => {
+  const entry = resolve(import.meta.dir, "../src/main.ts"),
+    dir = mkdtempSync(join(tmpdir(), "cv-trk-")),
+    socket = join(dir, "c.sock"),
+    session = stubSession(),
+    server = await startServer({ path: socket, session, recorder: stubRecorder(), pid: 7 });
+  try {
+    const child = Bun.spawn([process.execPath, entry, "--trick"], {
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+      env: { HOME: dir, PATH: process.env.PATH },
+    });
+    const ready = JSON.stringify({ event: "ready", version: 2, config: { socket }, kv: {} });
+    // Split mid-line: the trick reads whole lines.
+    child.stdin.write(ready.slice(0, 10));
+    child.stdin.flush();
+    await Bun.sleep(30);
+    child.stdin.write(ready.slice(10) + "\n");
+    child.stdin.flush();
+    const reader = child.stdout.getReader(),
+      decoder = new TextDecoder();
+    let text = "";
+    for (let i = 0; i < 100 && !text.includes("\n"); i++) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      text += decoder.decode(value);
+    }
+    expect(JSON.parse(text.trim())).toEqual({
+      op: "ui.set",
+      key: "voice",
+      view: { kind: "title", spans: [{ text: "♫" }], color: "accent", action: "toggle-1", slot: "voice" },
+    });
+    reader.releaseLock();
+    child.stdin.end();
+    const started = performance.now();
+    expect(await child.exited).toBe(0);
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(await new Response(child.stderr).text()).toBe("");
+  } finally {
+    server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/** Runs `main(["--install-trick"])` without a terminal, with `env` set on process.env. */
+async function installing(env: Record<string, string>) {
+  const saved = Object.keys(env).map(k => [k, process.env[k]] as const),
+    out: string[] = [],
+    err: string[] = [],
+    write = process.stdout.write,
+    ewrite = process.stderr.write;
+  Object.assign(process.env, env);
+  process.stdout.write = ((t: string) => (out.push(t), true)) as typeof process.stdout.write;
+  process.stderr.write = ((t: string) => (err.push(t), true)) as typeof process.stderr.write;
+  try {
+    return { code: await main(["--install-trick"], { terminal: false }), out: out.join(""), err: err.join("") };
+  } finally {
+    process.stdout.write = write;
+    process.stderr.write = ewrite;
+    for (const [k, v] of saved) v === undefined ? delete process.env[k] : (process.env[k] = v);
+  }
+}
+
+test("--install-trick writes the manifest, prints where and what next, and exits 0 (US3 scenario 1)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cv-it-"));
+  try {
+    const r = await installing({ CORGI_TRICKS_DIR: join(dir, "tricks"), XDG_RUNTIME_DIR: dir }),
+      path = join(dir, "tricks", "corgi-voice", "trick.toml");
+    expect([r.code, r.out, r.err]).toEqual([
+      0,
+      `Installed the corgi-voice trick: ${path}\nNext: corgi tricks reload, then corgi tricks list\n`,
+      "",
+    ]);
+    const manifest = Bun.TOML.parse(readFileSync(path, "utf8")) as { config: { socket: string } };
+    expect(manifest.config.socket).toBe(join(dir, "corgi-voice.sock"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("--install-trick into a folder it cannot write says why and exits 1 (FR-012)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cv-it-")),
+    locked = join(dir, "locked");
+  mkdirSync(locked, { mode: 0o500 });
+  try {
+    const r = await installing({ CORGI_TRICKS_DIR: join(locked, "tricks"), XDG_RUNTIME_DIR: dir });
+    expect([r.code, r.out]).toEqual([1, ""]);
+    expect(r.err).toStartWith("corgi-voice: cannot install the trick: ");
+    expect(r.err).toContain("EACCES");
+  } finally {
+    chmodSync(locked, 0o700);
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

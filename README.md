@@ -263,6 +263,49 @@ The exit code tells a script what happened: `0` the line it printed is the new s
 
 For a status bar (sketchybar, tmux), run `corgi-voice --watch` once and redraw on each line, or call `corgi-voice --status` on a timer.
 
+## Voice icon in Corgi
+
+corgi-voice ships a small Corgi trick that shows the voice state in Corgi's sidebar title row, left of `[ + ]`:
+
+| Icon | When |
+|---|---|
+| `♫` in `accent` | listening |
+| `♫` in `faint` | muted |
+| `●` in `hot` (red) | a recording runs |
+| `●` in `warm` (amber) | the recording is paused |
+| nothing | voice cannot listen (microphone missing, denied or busy, transcription server down), or corgi-voice is not running |
+
+The icon follows the mute state and the recording only, not the target: it shows also while no viewer is attached or Corgi is unreachable from corgi-voice.
+Click the `♫` (or focus it with Corgi's trick-button keys and press Enter) to mute or unmute, exactly as `m` does; the window adds its `muted from outside` row.
+The recording dots are not pressable, so a click during a recording never unmutes dictation; use the window or a hotkey then.
+When corgi-voice quits the icon disappears, and it comes back within a few seconds of corgi-voice starting again.
+
+It needs a Corgi with Tricks and title items: tals/corgi#74 and tals/corgi#198, or a custom build containing both.
+An older Corgi refuses the item; the trick then logs the error once and shows nothing.
+
+Install it, then let Corgi load it:
+
+```bash
+corgi-voice --install-trick
+corgi tricks reload
+corgi tricks list          # corgi-voice is listed and running
+```
+
+`corgi-voice --install-trick` writes `corgi-voice/trick.toml` into Corgi's tricks folder (`$CORGI_TRICKS_DIR`, else `${XDG_CONFIG_HOME:-~/.config}/corgi/tricks`), replacing only that file when run again; set `CORGI_TRICKS_DIR` only when the Corgi daemon has the same value.
+Corgi starts tricks with a reduced environment, so the manifest carries absolute paths for `bun` and corgi-voice and the control socket's path.
+For `bun` it takes a link on `PATH` to the running Bun when there is one (Homebrew's `/opt/homebrew/bin/bun`), so upgrading Bun keeps working.
+Run the install again after moving corgi-voice or switching to another Bun: with a stale program path Corgi reports the trick as failed in `corgi tricks list`.
+Run it again also after changing `XDG_RUNTIME_DIR`, `XDG_STATE_HOME` or `TMPDIR`: a stale socket path leaves the trick idle, showing nothing.
+The installed manifest is specific to this machine, so do not sync it to remote machines; the icon only matters where the microphone is.
+`tricks/voice/` in this repository holds a reference copy of the manifest.
+
+To uninstall, remove the folder and reload:
+
+```bash
+rm -r "${CORGI_TRICKS_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/corgi/tricks}/corgi-voice"
+corgi tricks reload
+```
+
 ## Troubleshooting
 
 ### Corgi unreachable

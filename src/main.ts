@@ -29,6 +29,8 @@ import { startServer } from "./control/server";
 import * as client from "./control/client";
 import { shortLine, cannot_listen, type VoiceState } from "./control/state";
 import { resolveCorgi, checkCapabilities } from "./corgi/command";
+import { runTrick, lines } from "./trick/trick";
+import * as trickInstall from "./trick/install";
 
 export const version: string = pkg.version;
 /** What a control command asks the running corgi-voice. */
@@ -39,6 +41,10 @@ type Flags = settings.VoiceFlags & {
   help?: boolean;
   control?: Control;
   json?: boolean;
+  /** Run as Corgi's sidebar voice icon (a raw JSONL trick). */
+  trick?: boolean;
+  /** Install that trick into Corgi's tricks folder. */
+  install_trick?: boolean;
 };
 const control_flags: Record<string, Control> = {
   "--mute": "mute",
@@ -56,6 +62,7 @@ Usage:
   corgi-voice --setup [--model NAME] [--corgi CMD]
   corgi-voice --mute | --unmute | --toggle-mute
   corgi-voice --status [--json] | --watch [--json]
+  corgi-voice --trick | --install-trick
   corgi-voice --help
 
 Flags:
@@ -78,6 +85,10 @@ Control the running corgi-voice (no terminal needed):
   --watch            print the state, then a line on every change
   --json             with --status or --watch: the state as JSON
   Exit: 0 done, 1 refused, 2 usage, 3 not running or no answer within 1 s
+
+Corgi's sidebar voice icon:
+  --trick            run as Corgi's sidebar voice icon (started by Corgi)
+  --install-trick    install that trick into Corgi's tricks folder
 `;
 
 /** Reads the arguments; anything else is a usage error. */
@@ -149,10 +160,20 @@ export function flags(args: string[]): Flags {
         if (out.json) throw Error("Usage");
         out.json = true;
         break;
+      case "--trick":
+        if (out.trick) throw Error("Usage");
+        out.trick = true;
+        break;
+      case "--install-trick":
+        if (out.install_trick) throw Error("Usage");
+        out.install_trick = true;
+        break;
       default:
         throw Error("Usage");
     }
   }
+  // The trick modes stand alone: no other flag, not even each other.
+  if ((out.trick || out.install_trick) && Object.keys(out).length > 1) throw Error("Usage");
   // Setup takes only the model and the corgi command.
   if (out.setup && Object.keys(out).some(k => !["setup", "model", "corgi"].includes(k))) throw Error("Usage");
   // A control command takes only --json, and --json only goes with the state.
@@ -225,6 +246,19 @@ async function control(op: Control, json: boolean): Promise<number> {
   process.stderr.write(`corgi-voice: ${why}\n`);
   return 1;
 }
+/** `--install-trick` (FR-011, FR-012): writes the manifest, says where and
+ * what next; 0 when written, 1 with the reason when not. */
+function installTrick(): number {
+  try {
+    const { path } = trickInstall.install(process.env);
+    process.stdout.write(`Installed the corgi-voice trick: ${path}\nNext: corgi tricks reload, then corgi tricks list\n`);
+    return 0;
+  } catch (error) {
+    const why = (error as { detail?: string }).detail ?? (error instanceof Error ? error.message : String(error));
+    process.stderr.write(`corgi-voice: cannot install the trick: ${why}\n`);
+    return 1;
+  }
+}
 /** The `corgi` command for this run, checked; throws `CorgiMissing` with the reason as `detail`. */
 async function corgiCommand(s: settings.VoiceSettings): Promise<string> {
   const found = resolveCorgi({ setting: s.corgi });
@@ -266,6 +300,16 @@ export async function main(args: string[], opts: { terminal?: boolean } = {}): P
     process.stdout.write(usage);
     return 0;
   }
+  // Corgi starts the trick without a terminal: its standard streams are Corgi's
+  // JSONL, and it takes nothing over (FR-009).
+  if (given.trick)
+    return runTrick({
+      input: lines(Bun.stdin.stream()),
+      write: line => void process.stdout.write(`${line}\n`),
+      log: line => void process.stderr.write(`${line}\n`),
+      env: process.env,
+    });
+  if (given.install_trick) return installTrick();
   // Before setup and the terminal check: a hotkey tool has no terminal, and
   // a control command reads no settings and takes over nothing (FR-010).
   if (given.control) return control(given.control, !!given.json);
