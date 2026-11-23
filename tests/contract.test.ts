@@ -149,3 +149,64 @@ test("the README shows the hotkey recipes, the state line, the JSON fields and t
   expect(section).toContain("`listening · bat · corgi-voice`");
   expect(section).toContain("`muted · cannot listen: microphone missing`");
 });
+
+test("src/trick/ reaches Corgi only on its own streams and corgi-voice only through the control client (FR-016)", () => {
+  const trick = sources.filter(f => relative(src, f).startsWith("trick/"));
+  expect(trick.map(f => relative(src, f)).sort()).toEqual(["trick/install.ts", "trick/item.ts", "trick/trick.ts"]);
+  for (const file of trick) {
+    const rel = relative(src, file),
+      text = readFileSync(file, "utf8");
+    // No process, no corgi command, no socket of its own.
+    for (const off of [
+      /\bspawn(?:Sync)?\s*\(/,
+      /\bexec(?:File|Sync)?\s*\(/,
+      /node:child_process/,
+      /\.\.\/corgi\//,
+      /\.\.\/util\/subprocess/,
+      /Bun\.connect/,
+      /Bun\.listen/,
+      /node:net/,
+    ])
+      expect([rel, String(off), off.test(text)]).toEqual([rel, String(off), false]);
+    for (const off of ["pane send", '"pane", "send"', '"send"']) expect([rel, off, text.includes(off)]).toEqual([rel, off, false]);
+    // Only the install writes files, and only the client is used of src/control/ (types aside).
+    for (const off of ["writeFileSync", "renameSync", "mkdirSync"])
+      expect([rel, off, text.includes(off)]).toEqual([rel, off, rel === "trick/install.ts"]);
+    for (const m of text.matchAll(/^import\s+(type\s+)?[^;]*?from\s+"\.\.\/control\/([^"]+)"/gm))
+      expect([rel, m[2], !!m[1] || m[2] === "client"]).toEqual([rel, m[2], true]);
+  }
+  // The trick sends only watch and toggle.
+  const loop = readFileSync(join(src, "trick", "trick.ts"), "utf8");
+  expect([...loop.matchAll(/request\([^,]+,\s*"(\w+)"/g)].map(m => m[1])).toEqual(["toggle"]);
+  expect(loop).toContain("watch(path");
+});
+
+test("the README shows the voice icon's states, the install, reload and the rerun note (FR-014)", () => {
+  const readme = readFileSync(join(root, "README.md"), "utf8"),
+    start = readme.indexOf("## Voice icon in Corgi"),
+    section = readme.slice(start, readme.indexOf("\n## ", start + 1));
+  expect(start).toBeGreaterThan(0);
+  for (const text of [
+    "corgi-voice --install-trick",
+    "corgi tricks reload",
+    "corgi tricks list",
+    "accent",
+    "faint",
+    "hot",
+    "warm",
+    "not pressable",
+    "muted from outside",
+    "To uninstall",
+    'rm -r "${CORGI_TRICKS_DIR:-',
+    "XDG_RUNTIME_DIR",
+    "XDG_STATE_HOME",
+    "TMPDIR",
+    "tals/corgi#74",
+    "tals/corgi#198",
+  ])
+    expect([text, section.includes(text)]).toEqual([text, true]);
+  const pointer = readFileSync(join(root, "tricks", "voice", "README.md"), "utf8");
+  expect(pointer).toContain("corgi-voice --install-trick");
+  const reference = Bun.TOML.parse(readFileSync(join(root, "tricks", "voice", "trick.toml"), "utf8")) as { id: string; command: string[] };
+  expect([reference.id, reference.command]).toEqual(["corgi-voice", ["corgi-voice", "--trick"]]);
+});

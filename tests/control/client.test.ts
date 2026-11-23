@@ -143,3 +143,42 @@ test("a line that is not an answer ends a watch as no answer, not as a quit", as
     expect(seen).toEqual([1]);
   }
 });
+
+test("aborting a watch ends it as closed, and the server sees the watcher leave", async () => {
+  const state = { pid: 1, muted: false, mode: "listening", unavailable: null, reason: null, recording: "none", target: null, updated_at: 1 };
+  const path = socket();
+  let opened = 0,
+    left = 0;
+  const server = Bun.listen({
+    unix: path,
+    socket: {
+      open: () => void opened++,
+      data: s => void s.write(JSON.stringify({ ok: true, state }) + "\n"),
+      close: () => void left++,
+    },
+  });
+  cleanups.push(() => server.stop(true));
+  const stop = new AbortController(),
+    seen: number[] = [],
+    watching = watch(path, a => void seen.push(a.state.pid), { timeoutMs: 1000, signal: stop.signal });
+  for (let i = 0; i < 200 && !seen.length; i++) await Bun.sleep(5);
+  expect(seen).toEqual([1]);
+  const started = performance.now();
+  stop.abort();
+  expect(await watching).toBe("closed");
+  expect(performance.now() - started).toBeLessThan(100);
+  for (let i = 0; i < 200 && !left; i++) await Bun.sleep(5);
+  expect([opened, left]).toEqual([1, 1]);
+});
+
+test("an already aborted signal never connects", async () => {
+  const path = socket();
+  let opened = 0;
+  const server = Bun.listen({ unix: path, socket: { open: () => void opened++, data() {} } });
+  cleanups.push(() => server.stop(true));
+  const stop = new AbortController();
+  stop.abort();
+  expect(await watch(path, () => {}, { signal: stop.signal })).toBe("closed");
+  await Bun.sleep(50);
+  expect(opened).toBe(0);
+});
